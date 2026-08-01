@@ -75,8 +75,12 @@ class DataProcessor:
             "title": DataProcessor.clean_text(article.get("title")),
             "url": article.get("url", ""),
             "date": DataProcessor.normalize_date(article.get("date")),
+            "pub_date": article.get("pub_date", ""),
+            "summary": article.get("summary", ""),
             "content": DataProcessor.clean_text(article.get("content")),
             "source": article.get("source", ""),
+            "is_official": article.get("is_official", False),
+            "search_mode": article.get("search_mode", ""),
             "crawl_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 

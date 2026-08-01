@@ -332,13 +332,6 @@ class NewsSpider(BaseSpider):
                 f"  本次总获取: {len(articles)} 条"
             )
 
-        # 来源过滤
-        if self.source_filter == "official":
-            articles = [a for a in articles if self._is_official(a)]
-            logger.info(
-                f"  官方媒体过滤后: {len(articles)} 条"
-            )
-
         return articles
 
     def _parse_results(self, html: str) -> List[Dict[str, str]]:

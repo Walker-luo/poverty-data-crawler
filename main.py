@@ -71,9 +71,9 @@ def run_gov_spider(storage: DataStorage, processor: DataProcessor, max_pages: in
 
 
 def run_news_spider_keyword(spider: NewsSpider, max_pages: int) -> list:
-    """策略1: 按关键词搜索 + 官方媒体过滤"""
+    """策略1: 按关键词搜索"""
     logger = logging.getLogger(__name__)
-    logger.info("策略: 关键词搜索 + 官方媒体过滤")
+    logger.info("策略: 关键词搜索")
 
     all_articles = []
     per_kw = max(1, max_pages // len(PRIORITY_KEYWORDS)) + 1

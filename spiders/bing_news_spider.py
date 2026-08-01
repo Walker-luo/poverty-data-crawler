@@ -189,8 +189,6 @@ class BingNewsSpider(BaseSpider):
         if not html:
             return []
         articles = self._parse_results(html)
-        if self.source_filter == "official":
-            articles = [a for a in articles if self._is_official(a)]
         return articles
 
     def _parse_results(self, html: str) -> List[Dict[str, str]]:
