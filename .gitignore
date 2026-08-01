@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# 数据文件 — 忽略内容但保留目录结构
+data/raw/**/*
+data/processed/**/*
+!data/raw/**/.gitkeep
+!data/processed/**/.gitkeep
+
+# 日志
+logs/*
+!logs/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 环境变量
+.env
+.env.local
