@@ -23,10 +23,11 @@ from utils.storage import DataStorage
 from utils.data_processor import DataProcessor
 
 
-def setup_logging():
+def setup_logging(verbose: bool = False):
     """配置日志"""
+    level = "DEBUG" if verbose else LOG_CONFIG["level"]
     logging.basicConfig(
-        level=getattr(logging, LOG_CONFIG["level"]),
+        level=getattr(logging, level),
         format=LOG_CONFIG["format"],
         datefmt=LOG_CONFIG["datefmt"],
         handlers=[
@@ -175,9 +176,13 @@ def main():
         "--engine", choices=["baidu", "bing"], default="baidu",
         help="搜索引擎: baidu (默认) | bing (不挑IP)",
     )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="详细日志模式 (DEBUG级别，可看到每次请求)",
+    )
     args = parser.parse_args()
 
-    setup_logging()
+    setup_logging(verbose=args.verbose)
     logger = logging.getLogger(__name__)
 
     start_time = datetime.now()

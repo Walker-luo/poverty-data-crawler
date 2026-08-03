@@ -29,8 +29,9 @@ UA_POOL = [
 class BaseSpider:
     """基础爬虫 — 请求管理 / 反爬检测 / 退避"""
 
-    def __init__(self, name: str = "base"):
+    def __init__(self, name: str = "base", delay: float = None):
         self.name = name
+        self.delay = delay if delay is not None else CRAWL_CONFIG["request_delay"]
         self.session = self._build_session()
         self.request_count = 0
         self.block_count = 0  # 被拦截次数
@@ -59,9 +60,8 @@ class BaseSpider:
 
     def _delay(self, extra: float = 0):
         """请求间隔（随机延时）"""
-        base = CRAWL_CONFIG["request_delay"]
         jitter = random.uniform(0.5, 2.0)
-        time.sleep(base * jitter + extra)
+        time.sleep(self.delay * jitter + extra)
 
     def _is_blocked(self, html: str) -> bool:
         """检测百度反爬/验证码页面"""

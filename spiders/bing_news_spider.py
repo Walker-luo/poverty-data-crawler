@@ -27,7 +27,7 @@ class BingNewsSpider(BaseSpider):
     BASE_URL = "https://www.bing.com/news/search"
 
     def __init__(self, source_filter: str = "official"):
-        super().__init__(name="bing")
+        super().__init__(name="bing", delay=1.0)  # Bing 反爬宽松，1秒间隔即可
         self.source_filter = source_filter
         self._official_domains = {
             info["domain"] for info in OFFICIAL_MEDIA.values()
@@ -37,6 +37,22 @@ class BingNewsSpider(BaseSpider):
     # ================================================================
     # 公开接口
     # ================================================================
+
+    def _preflight_check(self) -> bool:
+        """连通性预检：发一次测试请求，确认 Bing 可访问且能解析到结果"""
+        logger.info("🔍 连通性预检: 测试 Bing 新闻搜索...")
+        try:
+            articles = self._fetch_page("扶贫", page=0)
+            if articles:
+                logger.info(f"✅ 预检通过: 获取到 {len(articles)} 条结果 (示例: {articles[0]['title'][:50]}...)")
+                return True
+            else:
+                logger.warning("⚠️ 预检警告: 请求成功但未解析到任何新闻卡片")
+                logger.warning("   可能原因: Bing 地区限制 / HTML 结构变化 / 网络代理")
+                return False
+        except Exception as e:
+            logger.error(f"❌ 预检失败: {e}")
+            return False
 
     def search_by_keyword(
         self, keyword: str, max_pages: int = 3
@@ -106,6 +122,11 @@ class BingNewsSpider(BaseSpider):
             f"  |  预计 {total_combos * max_pages} 次请求"
         )
         logger.info("=" * 50)
+
+        # ---- 连通性预检 ----
+        if not self._preflight_check():
+            logger.error("连通性预检未通过，请检查网络或 Bing 可访问性后重试")
+            return []
 
         # ---- Phase 1: 逐年关键词搜索 ----
         logger.info("▸ Phase 1: 逐年关键词搜索")
@@ -233,6 +254,20 @@ class BingNewsSpider(BaseSpider):
         soup = BeautifulSoup(html, "lxml")
         articles = []
         cards = soup.select("[class*=news-card]")
+
+        if not cards:
+            # 诊断日志：无结果时输出 HTML 概况，方便排查
+            text_preview = html[:800].replace("\n", " ")[:400]
+            logger.warning(
+                f"未匹配到新闻卡片 (news-card) | "
+                f"HTML长度: {len(html)} | "
+                f"开头: {text_preview}..."
+            )
+            # 尝试备用选择器
+            fallback_cards = soup.select(".news-card, [class*=card], [class*=result]")
+            if fallback_cards:
+                logger.info(f"备用选择器匹配到 {len(fallback_cards)} 个候选元素")
+            return []
 
         for card in cards:
             try:
