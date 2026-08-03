@@ -1,5 +1,5 @@
 # ============================================
-# Bing 新闻搜索爬虫 — 不挑IP，无反爬
+# Bing 新闻搜索爬虫
 # ============================================
 import re
 import logging
@@ -18,16 +18,16 @@ logger = logging.getLogger(__name__)
 
 class BingNewsSpider(BaseSpider):
     """
-    Bing 新闻搜索爬虫
+    Bing 新闻搜索爬虫 — 无封IP风险，稳定采集
 
-    和百度 NewsSpider 接口完全一致，直接替换引擎:
+    用法:
       python main.py --source news --strategy maximize --engine bing
     """
 
     BASE_URL = "https://www.bing.com/news/search"
 
     def __init__(self, source_filter: str = "official"):
-        super().__init__(name="bing_news")
+        super().__init__(name="bing")
         self.source_filter = source_filter
         self._official_domains = {
             info["domain"] for info in OFFICIAL_MEDIA.values()
@@ -35,12 +35,13 @@ class BingNewsSpider(BaseSpider):
         self._official_names = set(OFFICIAL_NAME_MAP.keys())
 
     # ================================================================
-    # 公开接口 (同名，直接替换)
+    # 公开接口
     # ================================================================
 
     def search_by_keyword(
         self, keyword: str, max_pages: int = 3
     ) -> List[Dict[str, str]]:
+        """按关键词搜索"""
         all_articles = []
         for page in range(max_pages):
             articles = self._fetch_page(keyword, page)
@@ -49,22 +50,10 @@ class BingNewsSpider(BaseSpider):
             all_articles.extend(articles)
         return all_articles
 
-    def search_by_site(
-        self, keyword: str, site_domain: str, max_pages: int = 2
-    ) -> List[Dict[str, str]]:
-        query = f"site:{site_domain} {keyword}"
-        all_articles = []
-        for page in range(max_pages):
-            articles = self._fetch_page(query, page)
-            if not articles:
-                break
-            all_articles.extend(articles)
-        return all_articles
-
     def search_by_years(
-        self, keyword: str, years: List[int], max_pages_per_year: int = 2
+        self, keyword: str, years: List[int], max_pages_per_year: int = 3
     ) -> List[Dict[str, str]]:
-        """按年份分区搜索 — 直接在 query 中加年份"""
+        """按年份分区搜索 — 将年份拼入搜索词"""
         all_articles = []
         for year in years:
             query = f"{keyword} {year}"
@@ -75,20 +64,17 @@ class BingNewsSpider(BaseSpider):
                 all_articles.extend(articles)
         return all_articles
 
-    def search_top_official_sites(
-        self, keyword: str = "扶贫", top_n: int = 5
+    def search_by_site(
+        self, keyword: str, site_domain: str, max_pages: int = 2
     ) -> List[Dict[str, str]]:
-        central_media = [
-            m for m in OFFICIAL_MEDIA.values() if m["level"] == "中央"
-        ][:top_n]
+        """站点定向搜索 (Bing 上效果不佳，不推荐)"""
+        query = f"site:{site_domain} {keyword}"
         all_articles = []
-        for media in central_media:
-            articles = self.search_by_site(keyword, media["domain"], max_pages=2)
-            for a in articles:
-                if not a.get("source"):
-                    a["source"] = media["name"]
+        for page in range(max_pages):
+            articles = self._fetch_page(query, page)
+            if not articles:
+                break
             all_articles.extend(articles)
-            logger.info(f"  {media['name']}({media['domain']}): {len(articles)} 条")
         return all_articles
 
     def maximize(
@@ -98,12 +84,11 @@ class BingNewsSpider(BaseSpider):
         max_pages: int = 5,
     ) -> List[Dict[str, str]]:
         """
-        全量采集 — 逐年关键词搜索 + 最近年份补齐
+        全量采集
 
-        设计逻辑:
-          - 主力: 每个关键词 × 每年的独立搜索 (覆盖最全，不重复)
-          - 补齐: 每个关键词无年份搜索 (捕获Bing年份过滤漏掉的，仅限最近2年)
-          - 不做 site: 搜索 (Bing site: 只返回导航卡片，产生0条真实数据)
+        两阶段:
+          1. 逐年搜索 — 每个关键词×每年独立查询 (主力)
+          2. 补齐搜索 — 关键词+最近2年 (捕获遗漏)
         """
         years = years or list(range(2013, 2027))
         keywords = keywords or KEYWORDS
@@ -111,25 +96,38 @@ class BingNewsSpider(BaseSpider):
         all_articles = []
         seen_urls = set()
 
-        logger.info(
-            f"Bing全量采集: {len(keywords)} 关键词 × {len(years)} 年, "
-            f"翻页深度 {max_pages}"
-        )
+        total_combos = len(keywords) * len(years_desc)
+        done = 0
 
-        # ---- 主力: 逐年关键词搜索 ----
-        logger.info("=== 逐年关键词搜索 ===")
-        keyword_empty_streak = {}
-        requests_this_phase = 0
+        logger.info("=" * 50)
+        logger.info(
+            f"📡 Bing 全量采集: {len(keywords)} 关键词 × {len(years)} 年"
+            f"  |  翻页深度 {max_pages}"
+            f"  |  预计 {total_combos * max_pages} 次请求"
+        )
+        logger.info("=" * 50)
+
+        # ---- Phase 1: 逐年关键词搜索 ----
+        logger.info("▸ Phase 1: 逐年关键词搜索")
+        kw_empty_streak: Dict[str, int] = {}
+        official_count = 0
 
         for kw in keywords:
-            keyword_empty_streak[kw] = 0
-            kw_new = 0
+            kw_empty_streak[kw] = 0
+            kw_total = 0
+            kw_official = 0
             for year in years_desc:
-                if keyword_empty_streak[kw] >= 3:
-                    logger.debug(f"  {kw}: 连续3年无结果，跳过 {year}及更早")
+                done += 1
+                if kw_empty_streak[kw] >= 3:
+                    skipped_years = [y for y in years_desc if y <= year]
+                    logger.debug(
+                        f"  ⏭ {kw} 连续 {kw_empty_streak[kw]} 年无结果, "
+                        f"跳过 {year} 及更早 ({len(skipped_years)} 年)"
+                    )
+                    done += len(skipped_years) - 1
                     break
+
                 articles = self.search_by_years(kw, [year], max_pages_per_year=max_pages)
-                requests_this_phase += max_pages  # 估算
                 new = 0
                 for a in articles:
                     if a["url"] not in seen_urls:
@@ -137,25 +135,50 @@ class BingNewsSpider(BaseSpider):
                         a["search_mode"] = "year"
                         all_articles.append(a)
                         new += 1
+                        if a["is_official"]:
+                            kw_official += 1
+
+                kw_total += new
+
                 if new == 0:
-                    keyword_empty_streak[kw] += 1
+                    kw_empty_streak[kw] += 1
                 else:
-                    keyword_empty_streak[kw] = 0
-                    kw_new += new
-            if kw_new:
-                logger.info(f"  {kw}: +{kw_new} 条")
+                    kw_empty_streak[kw] = 0
+
+                # 每5个年份组合输出一次进度
+                if done % max(1, total_combos // 10) == 0:
+                    logger.info(
+                        f"  进度 {done}/{total_combos} "
+                        f"({done * 100 // total_combos}%)  "
+                        f"已收集 {len(all_articles)} 条"
+                    )
+
+            if kw_total:
+                logger.info(
+                    f"  ✓ {kw}: {kw_total} 条"
+                    + (f" (官媒 {kw_official})" if kw_official else "")
+                )
             else:
-                logger.warning(f"  {kw}: 所有年份 0 命中")
+                logger.warning(f"  ✗ {kw}: 所有年份均无结果")
 
-        logger.info(f"逐年搜索完成: 累计 {len(all_articles)} 条")
+        official_count = sum(1 for a in all_articles if a["is_official"])
+        logger.info(
+            f"Phase 1 完成: {len(all_articles)} 条 "
+            f"(官媒 {official_count}, 其他 {len(all_articles) - official_count})"
+        )
 
-        # ---- 补齐: 最近2年无年份过滤搜索 ----
+        # ---- Phase 2: 补齐搜索 ----
         recent_years = years_desc[:2]
         active_kw = [
             kw for kw in keywords
-            if keyword_empty_streak.get(kw, 0) < len(years_desc)
+            if kw_empty_streak.get(kw, 0) < len(years_desc)
         ]
-        logger.info(f"=== 补齐搜索: {len(active_kw)} 关键词 × 最近{len(recent_years)}年 ===")
+        logger.info(
+            f"▸ Phase 2: 补齐搜索 "
+            f"({len(active_kw)} 个有效关键词 × 最近 {recent_years} 年)"
+        )
+
+        phase2_total = 0
         for kw in active_kw:
             query = f"{kw} {' '.join(str(y) for y in recent_years)}"
             articles = self.search_by_keyword(query, max_pages=max_pages)
@@ -166,23 +189,37 @@ class BingNewsSpider(BaseSpider):
                     a["search_mode"] = "catchup"
                     all_articles.append(a)
                     new += 1
+            phase2_total += new
             if new:
-                logger.info(f"  {kw}: +{new} 条")
+                logger.info(f"  ✓ {kw}: +{new} 条")
 
-        logger.info(f"=== 全量采集完成: 共 {len(all_articles)} 条 ===")
+        logger.info(f"Phase 2 完成: +{phase2_total} 条, 累计 {len(all_articles)} 条")
+
+        # ---- 汇总 ----
+        final_official = sum(1 for a in all_articles if a["is_official"])
+        logger.info("=" * 50)
+        logger.info(
+            f"✅ 全量采集完成!"
+            f"  共 {len(all_articles)} 条"
+            f"  |  官媒 {final_official} 条 ({final_official * 100 // max(1, len(all_articles))}%)"
+            f"  |  其他 {len(all_articles) - final_official} 条"
+            f"  |  请求 {self.request_count} 次"
+            f"  |  拦截 {self.block_count} 次"
+        )
+        logger.info("=" * 50)
         return all_articles
 
     # ================================================================
-    # 内部实现 — Bing HTML 解析
+    # 内部: 页面获取与解析
     # ================================================================
 
     def _fetch_page(
         self, query: str, page: int = 0
     ) -> List[Dict[str, str]]:
-        """获取并解析一页 Bing 新闻搜索结果"""
+        """获取一页搜索结果并解析"""
         params = {
             "q": query,
-            "first": page * 10 + 1,  # Bing 分页: 1, 11, 21...
+            "first": page * 10 + 1,
             "FORM": "YFNR",
         }
         html = self.fetch(self.BASE_URL, params=params)
@@ -199,7 +236,7 @@ class BingNewsSpider(BaseSpider):
 
         for card in cards:
             try:
-                # 标题链接: 第一个指向外部的 a 标签
+                # 标题 & 链接 — 第一个指向外部的 a 标签
                 title = ""
                 url = ""
                 for a in card.find_all("a", href=True):
@@ -218,16 +255,15 @@ class BingNewsSpider(BaseSpider):
 
                 title = re.sub(r"\s+", " ", title).strip()
 
-                # 来源和日期: Bing 有 class="source" 标签
-                # 格式: "新华社 on MSN1 天" 或 "腾讯网17 天" 或 "人民网8 个月"
+                # 来源 & 发布时间 — Bing 的 class="source" 标签
+                #   原始格式: "新华社 on MSN1 天" / "腾讯网17 天" / "人民网8 个月"
+                #   解析后:   source="新华社"  date="1 天"
                 source = ""
                 date = ""
                 source_el = card.select_one("[class*=source]")
                 if source_el:
                     source_text = source_el.get_text(strip=True)
-                    # "新华社 on MSN1 天" → "新华社 1 天"
                     source_text = re.sub(r"\s*on\s+MSN\s*", " ", source_text)
-                    # 匹配合并后的: "{来源} {N} {单位}"
                     m = re.match(
                         r"^(.+?)\s*(\d+)\s*(天|小时|分钟|个月|年|秒)\s*$",
                         source_text,
@@ -236,16 +272,15 @@ class BingNewsSpider(BaseSpider):
                         source = m.group(1).strip()
                         date = f"{m.group(2)} {m.group(3)}"
 
-                # 从 URL 中提取绝对日期 (Bing 只给相对时间)
+                # 从 URL 中提取发布日期 (Bing 只给相对时间)
                 pub_date = self._extract_url_date(url)
 
-                # 摘要: 从 card body 中取
+                # 摘要
                 summary = ""
                 desc_el = card.select_one("[class*=snippet], [class*=body], [class*=desc]")
                 if desc_el:
                     summary = desc_el.get_text(strip=True)[:200]
                 else:
-                    # 用整个 card 文本，去掉来源行和标题
                     full = card.get_text(strip=True)
                     if source and full.startswith(source):
                         full = full[len(source):]
@@ -258,38 +293,25 @@ class BingNewsSpider(BaseSpider):
                 articles.append({
                     "title": title,
                     "url": url,
-                    "date": date,              # Bing 显示时间: "5 年" "2 天"
-                    "pub_date": pub_date,      # URL中提取的绝对日期: "2021-02-26"
+                    "date": date,
+                    "pub_date": pub_date,
                     "summary": summary[:200],
                     "source": source,
                     "is_official": self._check_official(source),
                     "search_mode": "",
                 })
 
-            except Exception as e:
-                logger.debug(f"解析Bing条目失败: {e}")
+            except Exception:
                 continue
 
         return articles
 
     # ================================================================
-    # 来源判定 (和百度版共用逻辑)
+    # 来源判定
     # ================================================================
 
-    def _is_official(self, article: Dict) -> bool:
-        source = article.get("source", "")
-        if source in self._official_names:
-            return True
-        url = article.get("url", "")
-        for domain in self._official_domains:
-            if domain in url:
-                return True
-        for name in self._official_names:
-            if len(name) >= 3 and name in source:
-                return True
-        return False
-
     def _check_official(self, source_name: str) -> bool:
+        """判定来源是否为官方媒体 (名称精确匹配 + 模糊匹配)"""
         if source_name in self._official_names:
             return True
         for name in self._official_names:
@@ -301,22 +323,19 @@ class BingNewsSpider(BaseSpider):
     def _extract_url_date(url: str) -> str:
         """从新闻 URL 路径中提取发布日期
 
-        中国新闻网URL常见格式:
-          .../2021-02/26/content_xxx.shtml → 2021-02-26
+        常见格式:
+          .../2021-02/26/content_xxx.shtml  → 2021-02-26
           .../n1/2021/1018/c436975-xxx.html → 2021-10-18
-          .../2026/0731/c42272-xxx.html → 2026-07-31
+          .../2026/0731/c42272-xxx.html     → 2026-07-31
         """
         if not url:
             return ""
-        # 模式1: /YYYY-MM/DD/
         m = re.search(r"/(\d{4})-(\d{2})/(\d{2})/", url)
         if m:
             return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-        # 模式2: /YYYY/MMDD/ 或 /n1/YYYY/MMDD/
         m = re.search(r"/(\d{4})/(\d{2})(\d{2})/", url)
         if m:
             return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-        # 模式3: .../YYYYMM/tYYYYMMDD_...
         m = re.search(r"/t(\d{8})_", url)
         if m:
             d = m.group(1)

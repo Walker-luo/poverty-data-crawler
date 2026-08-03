@@ -91,10 +91,19 @@ class BaseSpider:
             self._rotate_ua()  # 每次请求轮换 UA
 
             try:
-                logger.info(
-                    f"[{self.name}] #{self.request_count}: {url[:100]}"
-                    + (f" (重试{attempt})" if attempt else "")
-                )
+                # 提取搜索词用于日志 (比打 URL 更有意义)
+                query_hint = ""
+                if params and "q" in params:
+                    query_hint = params["q"][:40]
+                elif params and "word" in params:
+                    query_hint = params["word"][:40]
+                log_msg = f"[{self.name}] #{self.request_count}"
+                if query_hint:
+                    log_msg += f" 搜索: {query_hint}"
+                if attempt:
+                    log_msg += f" (重试{attempt})"
+                logger.debug(log_msg)
+
                 resp = self.session.get(
                     url, params=params,
                     timeout=CRAWL_CONFIG["timeout"], **kwargs,
