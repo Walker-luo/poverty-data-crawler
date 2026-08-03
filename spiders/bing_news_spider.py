@@ -33,6 +33,8 @@ class BingNewsSpider(BaseSpider):
             info["domain"] for info in OFFICIAL_MEDIA.values()
         }
         self._official_names = set(OFFICIAL_NAME_MAP.keys())
+        # 锚定国际版，防止中国IP被重定向到 cn.bing.com（cn 版不支持 /news/search）
+        self.session.headers["Accept-Language"] = "en-US,en;q=0.9,zh-CN;q=0.8"
 
     # ================================================================
     # 公开接口
@@ -242,6 +244,7 @@ class BingNewsSpider(BaseSpider):
             "q": query,
             "first": page * 10 + 1,
             "FORM": "YFNR",
+            "setmkt": "en-US",       # 锚定国际版，防止中国IP被重定向到 cn.bing.com
         }
         html = self.fetch(self.BASE_URL, params=params)
         if not html:
