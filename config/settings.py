@@ -110,7 +110,63 @@ OFFICIAL_MEDIA = {
         "level": "中央",
     },
 
-    # --- 地方党媒（示例）---
+    # --- 中央级广播/电视/报刊 ---
+    "cnr": {
+        "name": "央广网",
+        "domain": "cnr.cn",
+        "alias": ["中央人民广播电台", "央广", "中国之声"],
+        "level": "中央",
+    },
+    "farmer": {
+        "name": "中国农网",
+        "domain": "farmer.com.cn",
+        "alias": ["农民日报", "中国农业新闻网"],
+        "level": "中央",
+    },
+    "legaldaily": {
+        "name": "法制网",
+        "domain": "legaldaily.com.cn",
+        "alias": ["法制日报", "法治日报", "法治网"],
+        "level": "中央",
+    },
+    "cnstock": {
+        "name": "中国证券网",
+        "domain": "cnstock.com",
+        "alias": ["中国证券报", "上海证券报"],
+        "level": "中央",
+    },
+    "jjckb": {
+        "name": "经济参考报",
+        "domain": "jjckb.cn",
+        "alias": ["经济参考网"],
+        "level": "中央",
+    },
+    "ceh": {
+        "name": "中国经济导报",
+        "domain": "ceh.com.cn",
+        "alias": ["中国发展网"],
+        "level": "中央",
+    },
+    "jyb": {
+        "name": "中国教育新闻网",
+        "domain": "jyb.cn",
+        "alias": ["中国教育报", "中国教育在线"],
+        "level": "中央",
+    },
+    "cqn": {
+        "name": "中国质量新闻网",
+        "domain": "cqn.com.cn",
+        "alias": ["中国质量报"],
+        "level": "中央",
+    },
+    "cyol": {
+        "name": "中青在线",
+        "domain": "cyol.com",
+        "alias": ["中国青年报", "青年参考"],
+        "level": "中央",
+    },
+
+    # --- 地方党媒 ---
     "beijing": {
         "name": "北京日报",
         "domain": "bjd.com.cn",
@@ -126,7 +182,127 @@ OFFICIAL_MEDIA = {
     "southcn": {
         "name": "南方网",
         "domain": "southcn.com",
-        "alias": ["南方日报"],
+        "alias": ["南方日报", "南方+"],
+        "level": "省级",
+    },
+    "gscn": {
+        "name": "中国甘肃网",
+        "domain": "gscn.com.cn",
+        "alias": ["甘肃网", "每日甘肃网"],
+        "level": "省级",
+    },
+    "voc": {
+        "name": "华声在线",
+        "domain": "voc.com.cn",
+        "alias": ["湖南日报", "新湖南"],
+        "level": "省级",
+    },
+    "dzwww": {
+        "name": "大众网",
+        "domain": "dzwww.com",
+        "alias": ["大众日报", "海报新闻", "齐鲁晚报"],
+        "level": "省级",
+    },
+    "yunnan": {
+        "name": "云南网",
+        "domain": "yunnan.cn",
+        "alias": ["云南日报", "云报"],
+        "level": "省级",
+    },
+    "fjsen": {
+        "name": "东南网",
+        "domain": "fjsen.com",
+        "alias": ["福建日报"],
+        "level": "省级",
+    },
+    "scol": {
+        "name": "四川在线",
+        "domain": "scol.com.cn",
+        "alias": ["四川日报", "川观新闻"],
+        "level": "省级",
+    },
+    "cnhubei": {
+        "name": "荆楚网",
+        "domain": "cnhubei.com",
+        "alias": ["湖北日报"],
+        "level": "省级",
+    },
+    "hinews": {
+        "name": "南海网",
+        "domain": "hinews.cn",
+        "alias": ["海南日报"],
+        "level": "省级",
+    },
+    "sznews": {
+        "name": "深圳新闻网",
+        "domain": "sznews.com",
+        "alias": ["深圳特区报", "深圳商报"],
+        "level": "省级",
+    },
+    "iqilu": {
+        "name": "齐鲁网",
+        "domain": "iqilu.com",
+        "alias": ["山东广播电视台"],
+        "level": "省级",
+    },
+    "jxnews": {
+        "name": "大江网",
+        "domain": "jxnews.com.cn",
+        "alias": ["江西日报", "中国江西网"],
+        "level": "省级",
+    },
+    "zjol": {
+        "name": "浙江在线",
+        "domain": "zjol.com.cn",
+        "alias": ["浙江日报"],
+        "level": "省级",
+    },
+    "cnwest": {
+        "name": "西部网",
+        "domain": "cnwest.com",
+        "alias": ["陕西日报", "陕西新闻网"],
+        "level": "省级",
+    },
+    "jschina": {
+        "name": "中国江苏网",
+        "domain": "jschina.com.cn",
+        "alias": ["新华日报"],
+        "level": "省级",
+    },
+    "gxnews": {
+        "name": "广西新闻网",
+        "domain": "gxnews.com.cn",
+        "alias": ["广西日报"],
+        "level": "省级",
+    },
+    "qianlong": {
+        "name": "千龙网",
+        "domain": "qianlong.com",
+        "alias": ["北京千龙"],
+        "level": "省级",
+    },
+    "chinatibetnews": {
+        "name": "中国西藏新闻网",
+        "domain": "chinatibetnews.com",
+        "alias": ["西藏日报", "西藏新闻网"],
+        "level": "省级",
+    },
+    "dbw": {
+        "name": "东北网",
+        "domain": "dbw.cn",
+        "alias": ["黑龙江日报", "东北新闻网"],
+        "level": "省级",
+    },
+    "cnnb": {
+        "name": "中国宁波网",
+        "domain": "cnnb.com.cn",
+        "alias": ["宁波日报"],
+        "level": "省级",
+    },
+    "ynet": {
+        "name": "北青网",
+        "domain": "ynet.com",
+        "alias": ["北京青年报"],
         "level": "省级",
     },
 }
