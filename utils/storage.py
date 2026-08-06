@@ -103,6 +103,110 @@ class DataStorage:
             return None
 
     # ================================================================
+    # Resource Schema JSON 输出（供 MongoDB 导入）
+    # ================================================================
+
+    def save_resource_json(
+        self,
+        resources: List[Dict[str, Any]],
+        crawl_type: str = "news",
+        filename: str = "resource.json",
+    ) -> str:
+        """
+        保存 MongoDB-ready Resource 文档 JSON
+
+        输出格式与 anti-poverty-server 的 Resource Schema 对齐，
+        可直接通过 mongoimport 或后端上传接口导入。
+
+        Args:
+            resources: ResourceMapper.map_batch() 的输出
+            crawl_type: 爬取类型
+            filename: 文件名
+
+        Returns:
+            文件路径
+        """
+        if not resources:
+            logger.warning("Resource 数据为空，跳过保存")
+            return ""
+
+        target_dir = self._run_dir(crawl_type, to_processed=True)
+        filepath = os.path.join(target_dir, filename)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(resources, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"Resource JSON 已保存: {filepath} ({len(resources)} 条)")
+        return filepath
+
+    def generate_import_script(
+        self,
+        crawl_type: str = "news",
+        resource_file: str = "resource.json",
+    ) -> str:
+        """
+        生成 MongoDB 导入脚本 (mongosh)
+
+        通过 originalUrl 做 upsert，重复运行不会产生重复数据。
+
+        Args:
+            crawl_type: 爬取类型
+            resource_file: Resource JSON 文件名
+
+        Returns:
+            脚本文件路径
+        """
+        target_dir = self._run_dir(crawl_type, to_processed=True)
+        filepath = os.path.join(target_dir, "import.mongosh.js")
+
+        script = f"""// MongoDB Resource 导入脚本
+// 用法: mongosh mongodb://localhost:27017/poverty-db --file import.mongosh.js
+//
+// Run ID: {self.run_id}
+// 说明: 基于 originalUrl 做 upsert，已存在的文档不会重复插入
+
+const fs = require('fs');
+const path = require('path');
+
+const data = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '{resource_file}'), 'utf-8')
+);
+
+print(`准备导入 ${{data.length}} 条资源文档...`);
+
+let inserted = 0;
+let skipped = 0;
+
+data.forEach(doc => {{
+    // 确保必填字段存在
+    if (!doc.title || !doc.originalUrl) {{
+        print(`跳过无效文档: ${{doc.title || '无标题'}}`);
+        return;
+    }}
+
+    const result = db.resources.updateOne(
+        {{ originalUrl: doc.originalUrl }},
+        {{ $setOnInsert: doc }},
+        {{ upsert: true }}
+    );
+
+    if (result.upsertedCount > 0) {{
+        inserted++;
+    }} else {{
+        skipped++;
+    }}
+}});
+
+print(`✅ 导入完成: ${{inserted}} 条新增, ${{skipped}} 条已存在 (跳过)`);
+"""
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(script)
+
+        logger.info(f"MongoDB 导入脚本已生成: {filepath}")
+        return filepath
+
+    # ================================================================
     # 统计报告 — 保存在 run 子目录
     # ================================================================
 

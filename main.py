@@ -21,6 +21,7 @@ from spiders.news_spider import NewsSpider
 from spiders.bing_news_spider import BingNewsSpider
 from utils.storage import DataStorage
 from utils.data_processor import DataProcessor
+from utils.resource_mapper import ResourceMapper
 
 
 def setup_logging(verbose: bool = False):
@@ -104,6 +105,8 @@ def run_news_spider(
     strategy: str = "keyword",
     years: list = None,
     engine: str = "baidu",
+    fetch_content: bool = False,
+    output_db: bool = False,
 ):
     """运行新闻爬虫 → 存入 data/*/news/"""
     logger = logging.getLogger(__name__)
@@ -145,6 +148,20 @@ def run_news_spider(
             storage.save_csv(cleaned, crawl_type="news", filename="news.csv", to_processed=True)
             storage.save_json(cleaned, crawl_type="news", filename="news.json", to_processed=True)
 
+            # ---- Resource Schema 输出 (供 MongoDB 导入) ----
+            if output_db:
+                mapper = ResourceMapper()
+                resources = mapper.map_batch(all_articles)
+
+                # 可选: 全文内容抓取
+                if fetch_content:
+                    from utils.content_fetcher import ContentFetcher
+                    with ContentFetcher() as fetcher:
+                        fetcher.fetch_all(resources)
+
+                storage.save_resource_json(resources, crawl_type="news")
+                storage.generate_import_script(crawl_type="news")
+
         logger.info(f"新闻数据爬取完成: 共 {len(all_articles)} 条")
 
     finally:
@@ -180,6 +197,14 @@ def main():
         "--verbose", action="store_true",
         help="详细日志模式 (DEBUG级别，可看到每次请求)",
     )
+    parser.add_argument(
+        "--fetch-content", action="store_true",
+        help="启用全文内容抓取 (从搜索结果URL获取完整正文，较慢)",
+    )
+    parser.add_argument(
+        "--output-db", action="store_true",
+        help="输出 MongoDB 导入格式 (resource.json + import.mongosh.js)",
+    )
     args = parser.parse_args()
 
     setup_logging(verbose=args.verbose)
@@ -214,6 +239,8 @@ def main():
             strategy=args.strategy,
             years=args.years,
             engine=args.engine,
+            fetch_content=args.fetch_content,
+            output_db=args.output_db,
         )
         results["news"] = articles
         total_requests += spider.request_count

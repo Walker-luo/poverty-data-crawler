@@ -43,22 +43,6 @@ class BingNewsSpider(BaseSpider):
     # 公开接口
     # ================================================================
 
-    def _preflight_check(self) -> bool:
-        """连通性预检：发一次测试请求，确认 Bing 可访问且能解析到结果"""
-        logger.info("🔍 连通性预检: 测试 Bing 新闻搜索...")
-        try:
-            articles = self._fetch_page("扶贫", page=0)
-            if articles:
-                logger.info(f"✅ 预检通过: 获取到 {len(articles)} 条结果 (示例: {articles[0]['title'][:50]}...)")
-                return True
-            else:
-                logger.warning("⚠️ 预检警告: 请求成功但未解析到任何新闻卡片")
-                logger.warning("   可能原因: Bing 地区限制 / HTML 结构变化 / 网络代理")
-                return False
-        except Exception as e:
-            logger.error(f"❌ 预检失败: {e}")
-            return False
-
     def search_by_keyword(
         self, keyword: str, max_pages: int = 3
     ) -> List[Dict[str, str]]:
@@ -125,21 +109,11 @@ class BingNewsSpider(BaseSpider):
 
         # ---- 连通性预检 ----
         if not self._preflight_check():
-<<<<<<< Updated upstream
-            logger.error("连通性预检未通过，请检查网络或 Bing 可访问性后重试")
-            return []
-
-        # ---- Phase 1: 逐年关键词搜索 ----
-        logger.info("▸ Phase 1: 逐年关键词搜索")
-        kw_empty_streak: Dict[str, int] = {}
-        official_count = 0
-=======
             logger.error(
                 "❌ 连通性预检失败，采集终止。"
                 "请检查网络或使用 --engine baidu 切换到百度搜索。"
             )
             return []
->>>>>>> Stashed changes
 
         # ---- Phase 1: 关键词搜索（无年份过滤） ----
         logger.info("▸ Phase 1: 关键词搜索")
@@ -265,11 +239,6 @@ class BingNewsSpider(BaseSpider):
         params = {
             "q": query,
             "first": page * 10 + 1,
-<<<<<<< Updated upstream
-            "FORM": "YFNR",
-            "setmkt": "en-US",       # 锚定国际版，防止中国IP被重定向到 cn.bing.com
-=======
->>>>>>> Stashed changes
         }
         html = self._fetch_with_diag(self.BASE_URL, params=params)
         if not html:
@@ -336,22 +305,6 @@ class BingNewsSpider(BaseSpider):
         articles = []
         cards = soup.select("[class*=news-card]")
 
-<<<<<<< Updated upstream
-        if not cards:
-            # 诊断日志：无结果时输出 HTML 概况，方便排查
-            text_preview = html[:800].replace("\n", " ")[:400]
-            logger.warning(
-                f"未匹配到新闻卡片 (news-card) | "
-                f"HTML长度: {len(html)} | "
-                f"开头: {text_preview}..."
-            )
-            # 尝试备用选择器
-            fallback_cards = soup.select(".news-card, [class*=card], [class*=result]")
-            if fallback_cards:
-                logger.info(f"备用选择器匹配到 {len(fallback_cards)} 个候选元素")
-            return []
-
-=======
         # 无 news-card 时的诊断
         if not cards:
             # 检测 Bing "无结果" 页面 — 静默返回空
@@ -380,7 +333,6 @@ class BingNewsSpider(BaseSpider):
                         logger.debug(f"备选选择器 '{sel}' 命中 {len(fallback)} 个节点")
 
         # ---- 解析 news-card 卡片 ----
->>>>>>> Stashed changes
         for card in cards:
             try:
                 # 如果 card 不是标准 news-card，尝试从备选结构提取
