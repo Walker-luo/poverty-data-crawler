@@ -18,6 +18,9 @@ data/processed/**/*
 logs/*
 !logs/.gitkeep
 
+# 数据库指南
+数据库相关指南/
+
 # IDE
 .vscode/
 .idea/

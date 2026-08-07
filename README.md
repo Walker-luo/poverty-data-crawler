@@ -4,32 +4,67 @@
 
 建立一个**大规模、结构化**的中国扶贫/脱贫攻坚相关数据数据库：
 - 📰 官方媒体新闻报道（2013 精准扶贫至今）
-- 🔍 按关键词 + 年份分区搜索，突破翻页限制
+- 🔍 按关键词搜索，支持百度/Bing 双引擎
+- 📥 下载原文为 .md 格式，LLM 清洗统一格式化
 - 📊 自动生成统计报告，数据按运行时间戳分目录保存
+
+## 完整工作流
+
+### 一行命令 (推荐)
+
+```bash
+python main.py --pipeline --strategy maximize --engine bing
+```
+
+自动完成: 爬取 → 下载正文 → LLM清洗
+
+### 分步执行
+
+```bash
+# ① 爬取
+python main.py --source news --strategy maximize --engine bing
+
+# ② 下载正文
+python main.py --download
+
+# ③ LLM 清洗 (先小批量测试)
+python main.py --clean --limit 3
+python main.py --clean                          # 全量
+```
 
 ## 环境准备
 
 ```bash
-conda activate crawler (python=3.11)
 pip install -r requirements.txt
 ```
 
 ## 命令行参数
 
-### 全部参数
+### 爬取参数
 
 | 参数 | 可选值 | 默认值 | 说明 |
 |------|--------|--------|------|
 | `--source` | `news`, `gov`, `all` | `all` | 数据来源 |
-| `--strategy` | `keyword`, `site`, `maximize` | `keyword` | 采集策略 (见下方详解) |
+| `--strategy` | `keyword`, `site`, `maximize` | `keyword` | 采集策略 |
 | `--engine` | `baidu`, `bing` | `baidu` | 搜索引擎 |
-| `--max-pages` | 整数 | 5 | 翻页深度，越大采集越多 |
+| `--max-pages` | 整数 | 5 | 翻页深度 |
 | `--filter` | `official`, `all`, `commercial` | `official` | 媒体来源过滤 |
 | `--years` | 空格分隔的年份 | 无 | 限定年份，如 `--years 2022 2023` |
-| `--fetch-content` | flag | 关闭 | 从搜索结果 URL 抓取全文正文（较慢） |
+| `--verbose` | flag | 关闭 | DEBUG 级别详细日志 |
+| `--fetch-content` | flag | 关闭 | 爬取时抓取全文正文 |
 | `--output-db` | flag | 关闭 | 额外输出 MongoDB 导入格式 |
 
-### `--strategy` 策略说明
+### 下载 & 清洗参数
+
+| 参数 | 可选值 | 默认值 | 说明 |
+|------|--------|--------|------|
+| `--download` | flag | — | 下载已爬取新闻正文为 .md |
+| `--clean` | flag | — | LLM 清洗 .md 文章为统一模板 (需 DeepSeek API Key) |
+| `--run-id` | 时间戳字符串 | 最新 run | 指定要处理的数据目录 |
+| `--delay` | 浮点数 | 2.0 | 请求间隔秒数 |
+| `--limit` | 整数 | 无 | 限制处理数量 (测试用) |
+
+### 策略对比
 
 | 值 | 说明 | 适用场景 |
 |------|------|------|
@@ -53,27 +88,40 @@ pip install -r requirements.txt
 
 ## 常用命令
 
+### ① 爬取
+
 ```bash
-# 快速测试 (4 请求，30 秒)
+# 快速测试
 python main.py --source news --strategy keyword --max-pages 1 --engine bing
 
-# 百度可用性测试 (测完就知道 IP 是否还被封)
-python main.py --source news --strategy keyword --max-pages 1 --engine baidu
-
-# 中等采样 (约 50-100 次请求，5-10 分钟)
-python main.py --source news --strategy keyword --max-pages 10 --engine bing
-
-# 限定年份全量采集 (精确控制)
-python main.py --source news --strategy maximize --years 2022 2023 --max-pages 5 --engine bing
-
-# 全量采集 全部14年 (挂 tmux 跑)
+# 全量采集
 python main.py --source news --strategy maximize --max-pages 5 --engine bing
 
-# 输出 MongoDB 导入格式 (resource.json + import.mongosh.js)
-python main.py --source news --strategy keyword --max-pages 5 --engine bing --output-db
+# 限定年份
+python main.py --source news --strategy maximize --years 2022 2023 --max-pages 5 --engine bing
+```
 
-# 建库采集 + 全文抓取 (较慢，适合首次建库)
-python main.py --source news --strategy maximize --max-pages 5 --engine bing --fetch-content --output-db
+### ② 下载正文
+
+```bash
+# 下载最新爬取的文章正文
+python main.py --download
+
+# 指定 run_id
+python main.py --download --run-id 20260805_122229
+```
+
+### ③ LLM 清洗
+
+```bash
+# 配置 API Key：在 utils/llm_cleaner.py 第 43 行填入
+DEEPSEEK_API_KEY = "sk-xxx"
+
+# 小批量测试 (3-5 篇)
+python main.py --clean --run-id 20260805_122229 --limit 3
+
+# 全量清洗
+python main.py --clean --run-id 20260805_122229
 ```
 
 ## 数据规模预估
@@ -163,35 +211,45 @@ Phase 3 (兜底): 核心官媒点名搜索
 ### 基础输出 (始终生成)
 
 ```
-data/processed/news/20260805_174923/
-├── news.csv          ← 爬虫原始字段 (Excel 可打开)
-├── news.json         ← 同上 JSON 格式
-└── summary.md         ← 统计报告
+data/processed/news/{run_id}/
+├── news.csv              ← 爬虫原始字段
+├── news.json             ← 同上 JSON 格式
+├── summary.md            ← 统计报告
+├── articles/             ← 下载的原文 .md (--download)
+│   ├── a1b2c3d4.md
+│   ├── e5f6g7h8.md
+│   ├── db_import.csv     ← 数据库批量导入索引
+│   └── clean/            ← LLM 清洗后 .md (--clean)
+│       ├── a1b2c3d4.md   ← 统一模板格式
+│       └── e5f6g7h8.md
+└── resource.json         ← MongoDB 导入 (--output-db)
 ```
 
-### MongoDB 导入输出 (需 `--output-db`)
+### MD 模板格式
 
+LLM 清洗后的每篇文章采用统一格式：
+
+```markdown
+---
+id: "run_id/article_id"
+title: "文章标题"
+source: "来源名称"
+source_url: "https://..."
+publish_date: "YYYY-MM-DD"
+category: "news"
+type: "text"
+country: "china"
+discourse_type: "institutional"
+keywords: ["扶贫", "脱贫攻坚"]
+development_stage: "precision"
+summary: "LLM 生成的100字摘要"
+---
+
+正文段落内容...
 ```
-data/processed/news/20260805_174923/
-├── ...
-├── resource.json      ← Resource Schema 格式，可直接 mongoimport
-└── import.mongosh.js  ← mongosh 导入脚本 (基于 originalUrl 做 upsert)
-```
 
-导入方式：
-```bash
-cd data/processed/news/20260805_174923/
-mongosh mongodb://localhost:27017/poverty-db --file import.mongosh.js
-```
-
-### 统计报告内容
-
-- 📊 来源分布 (每个媒体贡献条数)
-- 📅 日期分布 (数据时间覆盖范围)
-- 🔑 关键词标题命中率
-- 🔍 搜索模式分布 (year/catchup 比例)
-- 📰 文章预览 (前 5 条)
-- 📋 汇总 (总条数、请求次数、拦截次数、官方占比)
+- YAML frontmatter → 机器可解析，对应数据库字段
+- 正文 → 纯段落，无广告/导航/推荐阅读
 
 ## 反爬机制
 
@@ -220,14 +278,16 @@ CRAWL_CONFIG = {
 2. **URL 域名匹配** — 文章 URL 包含官方媒体域名
 3. **来源名称模糊匹配** — 来源名包含媒体名 (如 "新华社新媒体" ⊃ "新华社")
 
-### 已收录官方媒体 (20+)
+### 已收录官方媒体 (48 个)
 
 | 级别 | 媒体 |
 |------|------|
 | 中央通讯社 | 新华网、人民网、央视网、中国新闻网、中国日报网 |
-| 中央报刊 | 光明网、中国经济网、中国青年网、中国网、环球网、求是网、中国军网 |
+| 中央广播 | 央广网 (中央人民广播电台) |
+| 中央报刊 | 光明网、中国经济网、中国青年网、中国网、环球网、求是网、中国军网、经济参考报、中国经济导报 |
+| 中央专业 | 法制网、中国证券网、中国农网、中国教育新闻网、中国质量新闻网、中青在线 |
 | 政府机构 | 中国政府网、人民政协网、中央纪委、国家发改委 |
-| 省级党媒 | 北京日报、上观新闻(上海)、南方网(广东) |
+| 省级党媒 | 北京日报、上观新闻(上海)、南方网(广东)、中国甘肃网、华声在线(湖南)、大众网(山东)、云南网、东南网(福建)、四川在线、荆楚网(湖北)、南海网(海南)、深圳新闻网、齐鲁网、大江网(江西)、浙江在线、西部网(陕西)、中国江苏网、广西新闻网、千龙网(北京)、中国西藏新闻网、东北网(黑龙江)、中国宁波网、北青网 |
 
 ### 采集关键词 (15个)
 
@@ -242,24 +302,33 @@ CRAWL_CONFIG = {
 
 ```
 poverty/
-├── main.py                   # 主入口，命令行控制
+├── main.py                   # 主入口 (爬取/下载/清洗)
 ├── requirements.txt          # Python 依赖
 ├── config/
-│   └── settings.py           # 媒体分类 / 关键词 / 采集规则 / 反爬参数
+│   └── settings.py           # 媒体分类(48个) / 关键词 / 采集规则
 ├── spiders/
-│   ├── base_spider.py        # 基础爬虫 (UA轮换/反爬检测/自动退避/Session管理)
-│   ├── news_spider.py        # 百度新闻爬虫 (关键词/时间分区/site定向)
-│   ├── bing_news_spider.py   # Bing 新闻爬虫 (关键词/时间分区)
-│   ├── gov_spider.py         # 政府网站爬虫
-│   └── baidu_news_spider.py  # 百度新闻独立爬虫 (兼容旧版)
+│   ├── base_spider.py        # 基础爬虫 (UA轮换/反爬检测/自适应delay)
+│   ├── news_spider.py        # 百度新闻爬虫
+│   ├── bing_news_spider.py   # Bing 新闻爬虫 (预检/自适应地区/三阶段)
+│   └── gov_spider.py         # 政府网站爬虫
 ├── utils/
 │   ├── data_processor.py     # 数据清洗/去重/日期标准化/关键词提取
-│   ├── resource_mapper.py    # 爬虫字段 → Resource Schema 映射 + 智能推断
-│   ├── content_fetcher.py    # 可选：从 URL 抓取全文正文
-│   └── storage.py            # 存储 + Markdown 统计报告 + MongoDB 导入脚本生成
+│   ├── storage.py            # CSV/JSON 存储 + 统计报告生成
+│   ├── news_md_downloader.py # 正文下载器 (URL → .md)
+│   ├── llm_cleaner.py        # LLM 清洗器 (DeepSeek API → 统一模板)
+│   ├── content_fetcher.py    # 全文抓取工具 (兼容旧版)
+│   └── resource_mapper.py    # Resource Schema 映射 (MongoDB 导入)
 ├── data/
-│   ├── raw/{news,gov}/       # 原始数据 (按 run_id 分目录)
-│   └── processed/{news,gov}/ # 清洗后数据 (按 run_id 分目录)
+│   ├── raw/                  # 原始数据
+│   ├── processed/            # 清洗后数据 (按 run_id 分目录)
+│   │   └── news/{run_id}/
+│   │       ├── news.csv
+│   │       ├── articles/     # 下载的 .md
+│   │       │   ├── *.md
+│   │       │   ├── db_import.csv
+│   │       │   └── clean/   # LLM 清洗后
+│   │       └── summary.md
+│   └── article_template.md   # 统一 MD 模板
 └── logs/                     # 运行日志
 ```
 

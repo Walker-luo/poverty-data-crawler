@@ -3,12 +3,17 @@
 # ============================================
 """
 用法:
-    python main.py --strategy keyword   # 快速采集 (默认，少量)
-    python main.py --strategy site      # 站点定向采集
-    python main.py --strategy maximize  # 全量采集 (建数据库用)
-    python main.py --max-pages 20       # 控制翻页深度
-    python main.py --filter official    # 仅保留官方媒体 (默认)
-    python main.py --filter all         # 不筛选来源
+    # 爬取
+    python main.py --strategy maximize --engine bing   # 全量采集
+    python main.py --strategy keyword --max-pages 5    # 快速测试
+
+    # 下载 & 清洗
+    python main.py --download --run-id ID              # 下载正文
+    python main.py --clean --run-id ID --limit 5       # LLM 清洗(测试)
+    python main.py --clean --run-id ID                 # LLM 清洗(全量)
+
+    # 一键流水线
+    python main.py --pipeline --strategy maximize --engine bing
 """
 import argparse
 import logging
@@ -205,10 +210,62 @@ def main():
         "--output-db", action="store_true",
         help="输出 MongoDB 导入格式 (resource.json + import.mongosh.js)",
     )
+    parser.add_argument(
+        "--download", action="store_true",
+        help="下载已爬取新闻正文为 .md 文件 (不运行爬虫)",
+    )
+    parser.add_argument(
+        "--clean", action="store_true",
+        help="LLM 清洗已下载的 .md 文章 (需设置 DEEPSEEK_API_KEY)",
+    )
+    parser.add_argument(
+        "--run-id", type=str, default=None,
+        help="指定 run_id (--download / --clean 模式)",
+    )
+    parser.add_argument(
+        "--delay", type=float, default=2.0,
+        help="请求间隔秒数 (--download / --clean 模式)",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="限制处理数量 (--download / --clean 模式测试用)",
+    )
+    parser.add_argument(
+        "--pipeline", action="store_true",
+        help="一键完成: 爬取 → 下载 → LLM清洗",
+    )
     args = parser.parse_args()
 
     setup_logging(verbose=args.verbose)
     logger = logging.getLogger(__name__)
+
+    # ---- 下载模式: 不运行爬虫，只下载已爬取文章的正文 ----
+    if args.download:
+        from utils.news_md_downloader import NewsMarkdownDownloader
+        try:
+            with NewsMarkdownDownloader(
+                run_id=args.run_id,
+                delay=args.delay,
+            ) as downloader:
+                downloader.download_all(limit=args.limit)
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            sys.exit(1)
+        return
+
+    # ---- LLM 清洗模式: 清洗已下载的 .md 文章 ----
+    if args.clean:
+        from utils.llm_cleaner import LLMCleaner
+        try:
+            with LLMCleaner(run_id=args.run_id) as cleaner:
+                cleaner.clean_all(limit=args.limit)
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            sys.exit(1)
+        except ValueError as e:
+            logger.error(str(e))
+            sys.exit(1)
+        return
 
     start_time = datetime.now()
     logger.info(f"扶贫数据爬虫启动 @ {start_time}")
@@ -266,6 +323,39 @@ def main():
     logger.info(f"Run ID: {storage.run_id}")
     logger.info(f"数据目录: data/processed/news/{storage.run_id}/")
     logger.info("=" * 50)
+
+    # ---- 流水线: 爬取 → 下载 → 清洗 ----
+    if args.pipeline and total > 0:
+        run_id = storage.run_id
+        logger.info("")
+        logger.info("=" * 50)
+        logger.info("🔗 流水线模式: 自动执行 下载 → LLM清洗")
+        logger.info(f"   Run ID: {run_id}")
+        logger.info("=" * 50)
+
+        # ① 下载
+        from utils.news_md_downloader import NewsMarkdownDownloader
+        try:
+            with NewsMarkdownDownloader(
+                run_id=run_id, delay=args.delay
+            ) as downloader:
+                downloader.download_all(limit=args.limit)
+        except Exception as e:
+            logger.error(f"下载步骤失败: {e}")
+
+        # ② LLM 清洗
+        from utils.llm_cleaner import LLMCleaner
+        try:
+            with LLMCleaner(run_id=run_id) as cleaner:
+                cleaner.clean_all(limit=args.limit)
+        except ValueError as e:
+            logger.warning(f"跳过清洗步骤: {e}")
+        except Exception as e:
+            logger.error(f"清洗步骤失败: {e}")
+
+        logger.info("=" * 50)
+        logger.info(f"🎉 流水线全部完成! 数据目录: data/processed/news/{run_id}/")
+        logger.info("=" * 50)
 
 
 if __name__ == "__main__":
