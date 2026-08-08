@@ -36,7 +36,12 @@ from typing import Dict, List, Optional, Tuple
 from openai import OpenAI
 from config.settings import KEYWORDS
 
+from dotenv import load_dotenv
+load_dotenv()  # 这行会读取 .env 文件并注入到环境变量中
+
+
 logger = logging.getLogger(__name__)
+
 
 # ============================================================
 # 🔑 在此填入 DeepSeek API Key（优先于环境变量）

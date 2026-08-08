@@ -29,9 +29,10 @@ UA_POOL = [
 class BaseSpider:
     """基础爬虫 — 请求管理 / 反爬检测 / 退避"""
 
-    def __init__(self, name: str = "base", delay: float = None):
+    def __init__(self, name: str = "base", delay: float = None, proxy: Optional[str] = None):
         self.name = name
         self.delay = delay if delay is not None else CRAWL_CONFIG["request_delay"]
+        self.proxy = proxy
         self.session = self._build_session()
         self.request_count = 0
         self.block_count = 0  # 被拦截次数
@@ -41,6 +42,13 @@ class BaseSpider:
         session = requests.Session()
         session.headers.update(HEADERS)
         session.headers["User-Agent"] = UA_POOL[0]
+
+        if self.proxy:
+            session.proxies = {
+                "http": self.proxy,
+                "https": self.proxy,
+            }
+            logger.info(f"[{self.name}] 使用代理: {self.proxy}")
 
         retry_strategy = Retry(
             total=CRAWL_CONFIG["max_retries"],

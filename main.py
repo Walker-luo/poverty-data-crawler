@@ -20,7 +20,7 @@ import logging
 import sys
 from datetime import datetime
 
-from config.settings import LOG_CONFIG, PRIORITY_KEYWORDS
+from config.settings import LOG_CONFIG, PRIORITY_KEYWORDS, PROXY
 from spiders.gov_spider import GovPovertySpider
 from spiders.news_spider import NewsSpider
 from spiders.bing_news_spider import BingNewsSpider
@@ -112,6 +112,7 @@ def run_news_spider(
     engine: str = "baidu",
     fetch_content: bool = False,
     output_db: bool = False,
+    proxy: str = None,
 ):
     """运行新闻爬虫 → 存入 data/*/news/"""
     logger = logging.getLogger(__name__)
@@ -122,7 +123,7 @@ def run_news_spider(
         logger.info(f"限定年份: {years}")
     logger.info("=" * 50)
 
-    spider = NewsSpider(source_filter=source_filter) if engine == "baidu" else BingNewsSpider(source_filter=source_filter)
+    spider = NewsSpider(source_filter=source_filter) if engine == "baidu" else BingNewsSpider(source_filter=source_filter, proxy=proxy)
     all_articles = []
 
     try:
@@ -201,6 +202,10 @@ def main():
     parser.add_argument(
         "--verbose", action="store_true",
         help="详细日志模式 (DEBUG级别，可看到每次请求)",
+    )
+    parser.add_argument(
+        "--proxy",
+        help="代理地址，如 socks5://127.0.0.1:10809 (国内服务器访问 Bing 需要)",
     )
     parser.add_argument(
         "--fetch-content", action="store_true",
@@ -290,6 +295,8 @@ def main():
         total_blocks += spider.block_count
 
     if args.source in ("news", "all"):
+        # 代理优先级: CLI参数 > 配置文件 > 环境变量 HTTPS_PROXY
+        proxy = args.proxy or PROXY
         articles, spider = run_news_spider(
             storage, processor, args.max_pages,
             source_filter=args.source_filter,
@@ -298,6 +305,7 @@ def main():
             engine=args.engine,
             fetch_content=args.fetch_content,
             output_db=args.output_db,
+            proxy=proxy,
         )
         results["news"] = articles
         total_requests += spider.request_count

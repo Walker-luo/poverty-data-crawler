@@ -29,8 +29,8 @@ class BingNewsSpider(BaseSpider):
 
     BASE_URL = "https://www.bing.com/news/search"
 
-    def __init__(self, source_filter: str = "official"):
-        super().__init__(name="bing", delay=1.0)  # Bing 反爬宽松，1秒间隔即可
+    def __init__(self, source_filter: str = "official", proxy: Optional[str] = None):
+        super().__init__(name="bing", delay=1.0, proxy=proxy)  # Bing 反爬宽松，1秒间隔即可
         self.source_filter = source_filter
         self._official_domains = {
             info["domain"] for info in OFFICIAL_MEDIA.values()
