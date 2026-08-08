@@ -202,7 +202,7 @@ class NewsSpider(BaseSpider):
           2. 每关键词的普通搜索 (补齐无日期的结果)
           3. Top N 官方媒体 site: 定向搜索
         """
-        years = years or list(range(2013, 2027))  # 精准扶贫至今
+        years = years or list(range(1979, 2027))  # 覆盖 reform→rural 全部阶段
         keywords = keywords or KEYWORDS  # 全量 15 个关键词
         all_articles = []
         seen_urls = set()

@@ -3,20 +3,143 @@
 ## 项目目标
 
 建立一个**大规模、结构化**的中国扶贫/脱贫攻坚相关数据数据库：
-- 📰 官方媒体新闻报道（2013 精准扶贫至今）
+- 📰 官方媒体新闻报道（覆盖 1979-2026，六个扶贫发展阶段）
 - 🔍 按关键词搜索，支持百度/Bing 双引擎
 - 📥 下载原文为 .md 格式，LLM 清洗统一格式化
 - 📊 自动生成统计报告，数据按运行时间戳分目录保存
 
-## 完整工作流
-
-### 一行命令 (推荐)
+## 快速开始
 
 ```bash
-python main.py --pipeline --strategy maximize --engine bing
+# 一行命令：爬取 + 下载 + 清洗
+python main.py --pipeline --source news --strategy maximize --engine bing
+
+# 小批量测试
+python main.py --pipeline --source news --strategy maximize --engine bing --limit 5
 ```
 
-自动完成: 爬取 → 下载正文 → LLM清洗
+## 环境准备
+
+```bash
+pip install -r requirements.txt
+```
+
+## 命令行参数详解
+
+### `--source` 数据来源
+
+| 值 | 说明 |
+|------|------|
+| `news` | **推荐**，新闻搜索爬虫（百度/Bing） |
+| `gov` | 政府网站爬虫（数据量少，不推荐） |
+| `all` | 同时运行 gov + news |
+
+默认 `all`，但 gov 爬虫产出极少，建议显式指定 `--source news`。
+
+### `--strategy` 采集策略
+
+| 值 | 说明 | 适用场景 |
+|------|------|------|
+| `keyword` | 关键词搜索 × N 页 | 快速测试、日常采样 |
+| `site` | 官媒站点 `site:domain` 定向搜索 | 特定媒体专题（仅百度） |
+| `maximize` | **全量采集**：逐年分区 + 补齐 + 官媒点名 | **建数据库用** |
+
+默认 `keyword`。建库必须用 `maximize`。
+
+### `--engine` 搜索引擎
+
+| 值 | 反爬 | 稳定性 | 推荐 |
+|------|------|------|:--:|
+| `bing` | 无封IP风险 | ✅ 稳定 | **推荐** |
+| `baidu` | IP 级封禁 | ⚠️ 大概率不可用 | 不推荐 |
+
+默认 `baidu`，建议显式指定 `--engine bing`。
+
+### `--max-pages` 翻页深度
+
+控制每个查询翻多少页。默认 `5`。
+
+| 值 | 说明 |
+|------|------|
+| `1-2` | 快速测试 |
+| `5` | **推荐**，均衡覆盖与耗时 |
+| `8-10` | 全量建库，耗时更长 |
+
+### `--filter` 媒体来源过滤
+
+| 值 | 说明 |
+|------|------|
+| `official` | **推荐**，仅保留官方媒体（党媒/央媒/政府网站），通过来源名+域名+别名三重匹配 |
+| `all` | 不过滤，含商业媒体 |
+| `commercial` | 仅商业/民间媒体 |
+
+### `--years` 限定年份
+
+空格分隔，仅在 `maximize` 策略下生效。不指定则覆盖全部 1979-2026。
+
+```bash
+--years 2023                  # 单年
+--years 2020 2021 2022        # 多年
+```
+
+### `--verbose` 详细日志
+
+开启 DEBUG 级别日志，输出每次 HTTP 请求详情。调试网络问题时使用。
+
+### `--download` 下载正文
+
+从已爬取的 URL 下载文章正文，保存为 `.md` 文件。不运行爬虫。
+
+```bash
+python main.py --download                     # 下载最新 run
+python main.py --download --run-id ID         # 指定 run
+python main.py --download --limit 5           # 只下载 5 篇测试
+```
+
+### `--clean` LLM 清洗
+
+调用 DeepSeek API 将下载的 `.md` 清洗为统一模板格式。需先在 [utils/llm_cleaner.py](utils/llm_cleaner.py) 第 43 行填入 API Key。
+
+```bash
+python main.py --clean --limit 3              # 测试 3 篇
+python main.py --clean                        # 全量清洗
+python main.py --clean --run-id ID            # 指定 run
+```
+
+### `--pipeline` 流水线
+
+一行命令完成 爬取 → 下载 → 清洗 全流程。
+
+```bash
+python main.py --pipeline --source news --strategy maximize --engine bing
+python main.py --pipeline --source news --strategy maximize --engine bing --limit 5  # 测试
+```
+
+### `--run-id` 指定数据目录
+
+不指定时自动选择最新的 `run_id`。适用于 `--download` 和 `--clean` 模式。
+
+### `--delay` 请求间隔
+
+`--download` 模式下的请求间隔秒数，默认 `2.0`。降低可加速但可能被限流。
+
+### `--limit` 限制数量
+
+限制 `--download` 或 `--clean` 模式下的处理数量，测试用。
+
+### `--fetch-content` / `--output-db`
+
+旧版功能，已不推荐使用。`--output-db` 输出 MongoDB 导入格式（resource.json）。
+
+## 常用命令
+
+### 一行命令（推荐）
+
+```bash
+python main.py --pipeline --source news --strategy maximize --engine bing
+```
+
+自动完成 爬取 → 下载正文 → LLM 清洗。
 
 ### 分步执行
 
@@ -27,101 +150,9 @@ python main.py --source news --strategy maximize --engine bing
 # ② 下载正文
 python main.py --download
 
-# ③ LLM 清洗 (先小批量测试)
-python main.py --clean --limit 3
-python main.py --clean                          # 全量
-```
-
-## 环境准备
-
-```bash
-pip install -r requirements.txt
-```
-
-## 命令行参数
-
-### 爬取参数
-
-| 参数 | 可选值 | 默认值 | 说明 |
-|------|--------|--------|------|
-| `--source` | `news`, `gov`, `all` | `all` | 数据来源 |
-| `--strategy` | `keyword`, `site`, `maximize` | `keyword` | 采集策略 |
-| `--engine` | `baidu`, `bing` | `baidu` | 搜索引擎 |
-| `--max-pages` | 整数 | 5 | 翻页深度 |
-| `--filter` | `official`, `all`, `commercial` | `official` | 媒体来源过滤 |
-| `--years` | 空格分隔的年份 | 无 | 限定年份，如 `--years 2022 2023` |
-| `--verbose` | flag | 关闭 | DEBUG 级别详细日志 |
-| `--fetch-content` | flag | 关闭 | 爬取时抓取全文正文 |
-| `--output-db` | flag | 关闭 | 额外输出 MongoDB 导入格式 |
-
-### 下载 & 清洗参数
-
-| 参数 | 可选值 | 默认值 | 说明 |
-|------|--------|--------|------|
-| `--download` | flag | — | 下载已爬取新闻正文为 .md |
-| `--clean` | flag | — | LLM 清洗 .md 文章为统一模板 (需 DeepSeek API Key) |
-| `--run-id` | 时间戳字符串 | 最新 run | 指定要处理的数据目录 |
-| `--delay` | 浮点数 | 2.0 | 请求间隔秒数 |
-| `--limit` | 整数 | 无 | 限制处理数量 (测试用) |
-
-### 策略对比
-
-| 值 | 说明 | 适用场景 |
-|------|------|------|
-| `keyword` | 关键词搜索 × N 页 | 快速测试、日常采样 |
-| `site` | 对官媒站点做 `site:domain` 定向搜索 | 特定媒体专题 (仅百度) |
-| `maximize` | 全量采集：逐年分区 + 补齐搜索 | **建数据库用** |
-
-### `--engine` 引擎对比
-
-| | 百度 `baidu` | Bing `bing` |
-|------|------|------|
-| 反爬程度 | IP 级封禁，极易被拦 | 无限制 |
-| 可用性 | ⚠️ 大概率不可用 | ✅ 稳定可用 |
-| 推荐 | 不推荐 | **推荐** |
-
-### `--filter` 过滤说明
-
-- `official`：仅保留官方媒体 (党媒、央媒、政府网站)，通过来源名+域名+别名三重匹配
-- `all`：不过滤，保留全部来源
-- `commercial`：仅保留民间/商业媒体
-
-## 常用命令
-
-### ① 爬取
-
-```bash
-# 快速测试
-python main.py --source news --strategy keyword --max-pages 1 --engine bing
-
-# 全量采集
-python main.py --source news --strategy maximize --max-pages 5 --engine bing
-
-# 限定年份
-python main.py --source news --strategy maximize --years 2022 2023 --max-pages 5 --engine bing
-```
-
-### ② 下载正文
-
-```bash
-# 下载最新爬取的文章正文
-python main.py --download
-
-# 指定 run_id
-python main.py --download --run-id 20260805_122229
-```
-
-### ③ LLM 清洗
-
-```bash
-# 配置 API Key：在 utils/llm_cleaner.py 第 43 行填入
-DEEPSEEK_API_KEY = "sk-xxx"
-
-# 小批量测试 (3-5 篇)
-python main.py --clean --run-id 20260805_122229 --limit 3
-
-# 全量清洗
-python main.py --clean --run-id 20260805_122229
+# ③ LLM 清洗（先测试，后全量）
+python main.py --clean --limit 3    # 测试 3 篇
+python main.py --clean               # 全量清洗
 ```
 
 ## 数据规模预估
@@ -143,17 +174,17 @@ python main.py --clean --run-id 20260805_122229
 百度需要通过时间分区绕过翻页限制和反爬：
 
 ```
-Phase 1: 15 关键词 × 14 年逐年分区搜索 (主力)
+Phase 1: 15 关键词 × 48 年逐年分区（bt/et 时间戳）
 Phase 2: 关键词通用搜索 (补齐)
 Phase 3: Top 10 官媒 site: 定向 (兜底)
 ```
 
 ### Bing 引擎 (三阶段，推荐)
 
-Bing 通过连通性预检后按三阶段采集：
+三阶段，覆盖 15 关键词 × 48 年逐年分区：
 
 ```
-Phase 1 (主力): 15 关键词纯文本搜索 + 深翻页
+Phase 1 (主力): 15 关键词 × 48 年逐年搜索
         → Bing 新闻不支持年份过滤，靠翻页深度覆盖
         → 自动去重，统计官媒占比
 

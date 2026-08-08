@@ -92,18 +92,23 @@ class BingNewsSpider(BaseSpider):
         全量采集
 
         三阶段:
-          1. 关键词搜索 — 纯关键词 + 深翻页 (Bing 新闻不支持年份过滤)
+          1. 逐年关键词搜索 — 每个关键词×每年独立查询 (主力)
           2. 补齐搜索 — 关键词+最近2年 (捕获遗漏)
-          3. 站点定向 — site: 核心官媒域名 (补齐官媒覆盖)
+          3. 官媒点名搜索 — 来源名+关键词组合 (补齐官媒覆盖)
         """
+        years = years or list(range(1979, 2027))  # 覆盖 reform→rural 全部阶段
         keywords = keywords or KEYWORDS
+        years_desc = sorted(years, reverse=True)
         all_articles = []
         seen_urls = set()
 
+        total_combos = len(keywords) * len(years_desc)
+
         logger.info("=" * 50)
         logger.info(
-            f"📡 Bing 全量采集: {len(keywords)} 关键词"
+            f"📡 Bing 全量采集: {len(keywords)} 关键词 × {len(years)} 年"
             f"  |  翻页深度 {max_pages}"
+            f"  |  预计 {total_combos * max_pages} 次请求"
         )
         logger.info("=" * 50)
 
@@ -115,27 +120,58 @@ class BingNewsSpider(BaseSpider):
             )
             return []
 
-        # ---- Phase 1: 关键词搜索（无年份过滤） ----
-        logger.info("▸ Phase 1: 关键词搜索")
+        # ---- Phase 1: 逐年关键词搜索 ----
+        logger.info("▸ Phase 1: 逐年关键词搜索")
+        kw_empty_streak: Dict[str, int] = {}
+        done = 0
+
         for kw in keywords:
-            articles = self.search_by_keyword(kw, max_pages=max_pages)
-            new = 0
+            kw_empty_streak[kw] = 0
+            kw_total = 0
             kw_official = 0
-            for a in articles:
-                if a["url"] not in seen_urls:
-                    seen_urls.add(a["url"])
-                    a["search_mode"] = "keyword"
-                    all_articles.append(a)
-                    new += 1
-                    if a["is_official"]:
-                        kw_official += 1
-            if new:
+            for year in years_desc:
+                done += 1
+                # 连续 3 年无结果 → 跳过更早年份
+                if kw_empty_streak[kw] >= 3:
+                    logger.debug(
+                        f"  ⏭ {kw} 连续 {kw_empty_streak[kw]} 年无结果, "
+                        f"跳过 {year} 及更早"
+                    )
+                    break
+
+                query = f"{kw} {year}"
+                articles = self._fetch_page(query, page=0)
+                new = 0
+                for a in articles:
+                    if a["url"] not in seen_urls:
+                        seen_urls.add(a["url"])
+                        a["search_mode"] = "year"
+                        all_articles.append(a)
+                        new += 1
+                        if a["is_official"]:
+                            kw_official += 1
+
+                kw_total += new
+                if new == 0:
+                    kw_empty_streak[kw] += 1
+                else:
+                    kw_empty_streak[kw] = 0
+
+                # 每 20 个组合输出一次进度
+                if done % max(1, total_combos // 10) == 0:
+                    logger.info(
+                        f"  进度 {done}/{total_combos} "
+                        f"({done * 100 // total_combos}%)  "
+                        f"已收集 {len(all_articles)} 条"
+                    )
+
+            if kw_total:
                 logger.info(
-                    f"  ✓ {kw}: {new} 条"
+                    f"  ✓ {kw}: {kw_total} 条"
                     + (f" (官媒 {kw_official})" if kw_official else "")
                 )
             else:
-                logger.debug(f"  - {kw}: 无结果")
+                logger.warning(f"  ✗ {kw}: 所有年份均无结果")
 
         official_count = sum(1 for a in all_articles if a["is_official"])
         logger.info(
@@ -164,22 +200,17 @@ class BingNewsSpider(BaseSpider):
 
         logger.info(f"Phase 2 完成: +{phase2_total} 条, 累计 {len(all_articles)} 条")
 
-        # ---- Phase 3: 核心官媒点名搜索 (补齐官媒覆盖) ----
+        # ---- Phase 3: 官媒点名搜索 (补齐官媒覆盖) ----
         # Bing 不支持 site: 操作符，改用"来源名 + 关键词"组合搜索
-        # 挑选覆盖最少的核心官媒进行定向搜索
-        central_names = [
-            m["name"] for m in OFFICIAL_MEDIA.values()
-            if m["level"] == "中央"
-        ][:12]  # 只取前12个最核心的，控制请求量
-        # 只用前2个最高频关键词
-        site_kws = keywords[:2]
+        all_names = [m["name"] for m in OFFICIAL_MEDIA.values()]
+        phase3_kws = keywords[:4]  # 前4个高频关键词
         phase3_total = 0
         logger.info(
             f"▸ Phase 3: 官媒点名搜索 "
-            f"({len(central_names)} 个核心官媒 × {len(site_kws)} 个关键词)"
+            f"({len(all_names)} 个官媒 × {len(phase3_kws)} 个关键词)"
         )
-        for src_name in central_names:
-            for kw in site_kws:
+        for src_name in all_names:
+            for kw in phase3_kws:
                 query = f"{src_name} {kw}"
                 articles = self._fetch_page(query, page=0)
                 new = 0
@@ -190,8 +221,8 @@ class BingNewsSpider(BaseSpider):
                         all_articles.append(a)
                         new += 1
                 if new:
-                    logger.debug(f"  \"{src_name} {kw}\": +{new} 条")
                     phase3_total += new
+                    logger.debug(f"  \"{src_name} {kw}\": +{new} 条")
 
         logger.info(f"Phase 3 完成: +{phase3_total} 条, 累计 {len(all_articles)} 条")
 
