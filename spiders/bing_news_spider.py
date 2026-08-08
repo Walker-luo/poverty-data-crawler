@@ -108,7 +108,7 @@ class BingNewsSpider(BaseSpider):
         logger.info(
             f"📡 Bing 全量采集: {len(keywords)} 关键词 × {len(years)} 年"
             f"  |  翻页深度 {max_pages}"
-            f"  |  预计 {total_combos * max_pages} 次请求"
+            f"  |  预计 {total_combos * max_pages + len(keywords) * (max_pages//2) + len(OFFICIAL_MEDIA) * min(4, len(keywords)) * (max_pages//2)} 次请求"
         )
         logger.info("=" * 50)
 
@@ -122,53 +122,63 @@ class BingNewsSpider(BaseSpider):
 
         # ---- Phase 1: 逐年关键词搜索 ----
         logger.info("▸ Phase 1: 逐年关键词搜索")
-        kw_empty_streak: Dict[str, int] = {}
+        kw_empty_streak: Dict[str, int] = {kw: 0 for kw in keywords}
+        kw_total: Dict[str, int] = {kw: 0 for kw in keywords}
+        kw_official: Dict[str, int] = {kw: 0 for kw in keywords}
+        active_keywords = set(keywords)  # 尚未被剪枝的关键词
         done = 0
 
-        for kw in keywords:
-            kw_empty_streak[kw] = 0
-            kw_total = 0
-            kw_official = 0
-            for year in years_desc:
+        for year in years_desc:
+            year_new = 0
+            for kw in keywords:
                 done += 1
-                # 连续 3 年无结果 → 跳过更早年份
-                if kw_empty_streak[kw] >= 3:
-                    logger.debug(
-                        f"  ⏭ {kw} 连续 {kw_empty_streak[kw]} 年无结果, "
-                        f"跳过 {year} 及更早"
-                    )
-                    break
+                if kw not in active_keywords:
+                    continue
 
                 query = f"{kw} {year}"
-                articles = self._fetch_page(query, page=0)
                 new = 0
-                for a in articles:
-                    if a["url"] not in seen_urls:
-                        seen_urls.add(a["url"])
-                        a["search_mode"] = "year"
-                        all_articles.append(a)
-                        new += 1
-                        if a["is_official"]:
-                            kw_official += 1
+                for page in range(max_pages):
+                    articles = self._fetch_page(query, page=page)
+                    if not articles:
+                        break  # 该年份翻页结束
+                    page_new = 0
+                    for a in articles:
+                        if a["url"] not in seen_urls:
+                            seen_urls.add(a["url"])
+                            a["search_mode"] = "year"
+                            all_articles.append(a)
+                            page_new += 1
+                            if a["is_official"]:
+                                kw_official[kw] += 1
+                    if page_new == 0:
+                        break  # 本页全重复，无需继续翻页
+                    new += page_new
 
-                kw_total += new
+                kw_total[kw] += new
+                year_new += new
                 if new == 0:
                     kw_empty_streak[kw] += 1
+                    if kw_empty_streak[kw] >= 3:
+                        active_keywords.discard(kw)
+                        logger.info(
+                            f"  ⏭ {kw} 连续 {kw_empty_streak[kw]} 年无结果, 已剪枝"
+                        )
                 else:
                     kw_empty_streak[kw] = 0
 
-                # 每 20 个组合输出一次进度
-                if done % max(1, total_combos // 10) == 0:
-                    logger.info(
-                        f"  进度 {done}/{total_combos} "
-                        f"({done * 100 // total_combos}%)  "
-                        f"已收集 {len(all_articles)} 条"
-                    )
+            logger.info(
+                f"  {year}年: +{year_new} 条 | "
+                f"进度 {done}/{total_combos} ({done*100//total_combos}%) | "
+                f"累计 {len(all_articles)} 条 | "
+                f"活跃关键词 {len(active_keywords)}/{len(keywords)}"
+            )
 
-            if kw_total:
+        # 各关键词汇总
+        for kw in keywords:
+            if kw_total[kw]:
                 logger.info(
-                    f"  ✓ {kw}: {kw_total} 条"
-                    + (f" (官媒 {kw_official})" if kw_official else "")
+                    f"  ✓ {kw}: {kw_total[kw]} 条"
+                    + (f" (官媒 {kw_official[kw]})" if kw_official[kw] else "")
                 )
             else:
                 logger.warning(f"  ✗ {kw}: 所有年份均无结果")
@@ -205,24 +215,43 @@ class BingNewsSpider(BaseSpider):
         all_names = [m["name"] for m in OFFICIAL_MEDIA.values()]
         phase3_kws = keywords[:4]  # 前4个高频关键词
         phase3_total = 0
+        phase3_done = 0
+        phase3_combos = len(all_names) * len(phase3_kws)
         logger.info(
             f"▸ Phase 3: 官媒点名搜索 "
-            f"({len(all_names)} 个官媒 × {len(phase3_kws)} 个关键词)"
+            f"({len(all_names)} 个官媒 × {len(phase3_kws)} 个关键词, "
+            f"共 {phase3_combos} 次请求)"
         )
         for src_name in all_names:
             for kw in phase3_kws:
+                phase3_done += 1
                 query = f"{src_name} {kw}"
-                articles = self._fetch_page(query, page=0)
                 new = 0
-                for a in articles:
-                    if a["url"] not in seen_urls:
-                        seen_urls.add(a["url"])
-                        a["search_mode"] = "source"
-                        all_articles.append(a)
-                        new += 1
+                for page in range(max(1, max_pages // 2)):  # Phase 3 翻页深度减半
+                    articles = self._fetch_page(query, page=page)
+                    if not articles:
+                        break
+                    page_new = 0
+                    for a in articles:
+                        if a["url"] not in seen_urls:
+                            seen_urls.add(a["url"])
+                            a["search_mode"] = "source"
+                            all_articles.append(a)
+                            page_new += 1
+                            new += 1
+                    if page_new == 0:
+                        break
                 if new:
                     phase3_total += new
                     logger.debug(f"  \"{src_name} {kw}\": +{new} 条")
+
+                # 每 20 个组合输出一次进度
+                if phase3_done % 20 == 0 or phase3_done == phase3_combos:
+                    logger.info(
+                        f"  Phase 3 进度 {phase3_done}/{phase3_combos} "
+                        f"({phase3_done * 100 // phase3_combos}%)  "
+                        f"+{phase3_total} 条"
+                    )
 
         logger.info(f"Phase 3 完成: +{phase3_total} 条, 累计 {len(all_articles)} 条")
 
