@@ -13,6 +13,8 @@ from config.settings import (
     CRAWL_CONFIG,
     OFFICIAL_MEDIA,
     OFFICIAL_NAME_MAP,
+    BROAD_KEYWORDS,
+    POLICY_KEYWORDS,
     KEYWORDS,
 )
 
@@ -92,23 +94,25 @@ class BingNewsSpider(BaseSpider):
         全量采集
 
         三阶段:
-          1. 逐年关键词搜索 — 每个关键词×每年独立查询 (主力)
-          2. 补齐搜索 — 关键词+最近2年 (捕获遗漏)
-          3. 官媒点名搜索 — 来源名+关键词组合 (补齐官媒覆盖)
+          1. 逐年通用词搜索 — BROAD_KEYWORDS × 2000-2026 (主力)
+          2. 补齐搜索 — 通用词+最近2年 (捕获遗漏)
+          3. 官媒点名搜索 — 48官媒 × POLICY_KEYWORDS (补齐政策术语覆盖)
         """
-        years = years or list(range(1979, 2027))  # 覆盖 reform→rural 全部阶段
-        keywords = keywords or KEYWORDS
+        years = years or list(range(2000, 2027))  # 2000年之前 Bing 新闻几乎无收录
+        keywords = keywords or BROAD_KEYWORDS    # Phase 1/2 用通用高频词
         years_desc = sorted(years, reverse=True)
         all_articles = []
         seen_urls = set()
 
         total_combos = len(keywords) * len(years_desc)
+        phase3_media_count = len(OFFICIAL_MEDIA)
+        phase3_kw_count = len(POLICY_KEYWORDS)
 
         logger.info("=" * 50)
         logger.info(
-            f"📡 Bing 全量采集: {len(keywords)} 关键词 × {len(years)} 年"
+            f"📡 Bing 全量采集: Phase1 {len(keywords)}通用词 × {len(years)}年"
             f"  |  翻页深度 {max_pages}"
-            f"  |  预计 {total_combos * max_pages + len(keywords) * (max_pages//2) + len(OFFICIAL_MEDIA) * min(4, len(keywords)) * (max_pages//2)} 次请求"
+            f"  |  Phase3 {phase3_media_count}官媒 × {phase3_kw_count}政策词"
         )
         logger.info("=" * 50)
 
@@ -158,7 +162,7 @@ class BingNewsSpider(BaseSpider):
                 year_new += new
                 if new == 0:
                     kw_empty_streak[kw] += 1
-                    if kw_empty_streak[kw] >= 3:
+                    if kw_empty_streak[kw] >= 5:
                         active_keywords.discard(kw)
                         logger.info(
                             f"  ⏭ {kw} 连续 {kw_empty_streak[kw]} 年无结果, 已剪枝"
@@ -210,16 +214,17 @@ class BingNewsSpider(BaseSpider):
 
         logger.info(f"Phase 2 完成: +{phase2_total} 条, 累计 {len(all_articles)} 条")
 
-        # ---- Phase 3: 官媒点名搜索 (补齐官媒覆盖) ----
-        # Bing 不支持 site: 操作符，改用"来源名 + 关键词"组合搜索
+        # ---- Phase 3: 官媒点名搜索 (补齐政策术语覆盖) ----
+        # Bing 不支持 site: 操作符，改用 "来源名 + 政策关键词" 组合搜索
+        # 这是效率最高的阶段：9.5条/请求 vs Phase1 的 1.6条/请求
         all_names = [m["name"] for m in OFFICIAL_MEDIA.values()]
-        phase3_kws = keywords[:4]  # 前4个高频关键词
+        phase3_kws = POLICY_KEYWORDS  # 全部15个政策关键词
         phase3_total = 0
         phase3_done = 0
         phase3_combos = len(all_names) * len(phase3_kws)
         logger.info(
             f"▸ Phase 3: 官媒点名搜索 "
-            f"({len(all_names)} 个官媒 × {len(phase3_kws)} 个关键词, "
+            f"({len(all_names)} 个官媒 × {len(phase3_kws)} 个政策词, "
             f"共 {phase3_combos} 次请求)"
         )
         for src_name in all_names:
