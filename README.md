@@ -98,13 +98,16 @@ python main.py --download --limit 5           # 只下载 5 篇测试
 
 ### `--clean` LLM 清洗
 
-调用 DeepSeek API 将下载的 `.md` 清洗为统一模板格式。需先在 [utils/llm_cleaner.py](utils/llm_cleaner.py) 第 43 行填入 API Key。
+调用 DeepSeek API 将下载的 `.md` 清洗为统一模板格式。需先运行爬虫或在 [utils/llm_cleaner.py](utils/llm_cleaner.py) 第 43 行填入 API Key。
 
 ```bash
 python main.py --clean --limit 3              # 测试 3 篇
 python main.py --clean                        # 全量清洗
 python main.py --clean --run-id ID            # 指定 run
 ```
+
+> **批量清洗节省 Token**：默认每 5 篇文章合并为一次 API 请求，System Prompt 只传一次。
+> 1000 篇文章从 1000 次请求 → 200 次，省 ~120 万 token。可通过修改 `DEFAULT_BATCH_SIZE` 调整每批篇数。
 
 ### `--pipeline` 流水线
 
@@ -126,6 +129,29 @@ python main.py --pipeline --source news --strategy maximize --engine bing --limi
 ### `--limit` 限制数量
 
 限制 `--download` 或 `--clean` 模式下的处理数量，测试用。
+
+### `--show-fails` 查看失败日志
+
+查看下载和清洗过程中的失败记录，方便排查问题。
+
+```bash
+python main.py --show-fails                    # 查看最新 run 的 fail.log
+python main.py --show-fails --run-id ID        # 查看指定 run 的 fail.log
+```
+
+输出示例：
+
+```
+📄 失败日志: data/processed/news/20260808_120000/fail.log
+   下载失败: 42 条 | 清洗失败: 3 条
+============================================================
+[2026-08-08 12:30:12] step=download | id=a1b2c3d4 | title=... | reason=请求超时
+[2026-08-08 12:30:45] step=download | id=e5f6g7h8 | title=... | reason=页面内容过短(45字符)
+[2026-08-08 15:05:10] step=clean | id=x9y0z1 | title=... | reason=API失败(3次重试)
+============================================================
+```
+
+fail.log 文件位于 `data/processed/news/{run_id}/fail.log`，下载和清洗共享同一文件，追加写入不覆盖。
 
 ### `--fetch-content` / `--output-db`
 

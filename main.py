@@ -12,6 +12,10 @@
     python main.py --clean --run-id ID --limit 5       # LLM 清洗(测试)
     python main.py --clean --run-id ID                 # LLM 清洗(全量)
 
+    # 查看失败日志
+    python main.py --show-fails                        # 最新 run 的失败记录
+    python main.py --show-fails --run-id ID            # 指定 run 的失败记录
+
     # 一键流水线
     python main.py --pipeline --strategy maximize --engine bing
 """
@@ -239,6 +243,10 @@ def main():
         "--pipeline", action="store_true",
         help="一键完成: 爬取 → 下载 → LLM清洗",
     )
+    parser.add_argument(
+        "--show-fails", action="store_true",
+        help="查看失败日志 (最新或指定 --run-id 的 fail.log)",
+    )
     args = parser.parse_args()
 
     setup_logging(verbose=args.verbose)
@@ -270,6 +278,41 @@ def main():
         except ValueError as e:
             logger.error(str(e))
             sys.exit(1)
+        return
+
+    # ---- 查看失败日志 ----
+    if args.show_fails:
+        from pathlib import Path
+        news_dir = Path("data/processed/news")
+        if args.run_id:
+            fail_path = news_dir / args.run_id / "fail.log"
+        else:
+            # 自动找最新 run
+            if not news_dir.exists() or not list(news_dir.iterdir()):
+                logger.error("未找到任何数据目录，请先运行爬虫")
+                sys.exit(1)
+            latest = sorted(
+                [d for d in news_dir.iterdir() if d.is_dir()],
+                reverse=True,
+            )[0]
+            fail_path = latest / "fail.log"
+
+        if not fail_path.exists():
+            logger.info(f"📄 无失败记录: {fail_path}")
+            return
+
+        content = fail_path.read_text(encoding="utf-8")
+        # 统计
+        download_fails = content.count("step=download")
+        clean_fails = content.count("step=clean")
+        logger.info(f"📄 失败日志: {fail_path}")
+        logger.info(f"   下载失败: {download_fails} 条 | 清洗失败: {clean_fails} 条")
+        logger.info("=" * 60)
+        # 只打印失败条目（跳过运行头分隔线）
+        for line in content.split("\n"):
+            if line.startswith("[") and "step=" in line:
+                print(line)
+        logger.info("=" * 60)
         return
 
     start_time = datetime.now()

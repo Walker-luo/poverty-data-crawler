@@ -93,6 +93,7 @@ class NewsMarkdownDownloader:
         self.success_count = 0
         self.fail_count = 0
         self.skip_count = 0
+        self._fail_log_path = None  # 延迟到 data_dir 确定后设置
         self._session = None
 
         # 定位数据目录
@@ -104,6 +105,7 @@ class NewsMarkdownDownloader:
         self.data_dir = Path(f"data/processed/news/{self.run_id}")
         self.csv_path = self.data_dir / "news.csv"
         self.articles_dir = self.data_dir / "articles"
+        self._fail_log_path = self.data_dir / "fail.log"
 
         if not self.csv_path.exists():
             raise FileNotFoundError(f"未找到 CSV 数据: {self.csv_path}")
@@ -142,6 +144,13 @@ class NewsMarkdownDownloader:
             f"(延迟 {self.delay}s, 超时 {self.timeout}s)"
         )
 
+        # 失败日志运行头
+        with open(self._fail_log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n"
+                    f"📥 Download Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+                    f"total={total}\n"
+                    f"{'='*60}\n")
+
         # 创建 articles 目录
         self.articles_dir.mkdir(parents=True, exist_ok=True)
 
@@ -162,7 +171,7 @@ class NewsMarkdownDownloader:
 
             # 下载正文
             url = article.get("url", "")
-            content = self._fetch_and_extract(url)
+            content, error = self._fetch_and_extract(url)
             self.request_count += 1
 
             if content:
@@ -170,6 +179,7 @@ class NewsMarkdownDownloader:
                 self.success_count += 1
             else:
                 self.fail_count += 1
+                self._log_fail("download", article_id, article.get("title", ""), url, error)
 
             # 进度日志
             if i % 10 == 0 or i == total:
@@ -182,8 +192,21 @@ class NewsMarkdownDownloader:
             f"| ⊘ {self.skip_count} 篇跳过 | 请求 {self.request_count} 次 "
             f"| 耗时 {elapsed:.0f}s"
         )
+        if self.fail_count > 0:
+            logger.info(f"📄 失败记录: {self._fail_log_path}")
 
         return self.success_count, self.fail_count, self.skip_count
+
+    def _log_fail(self, step: str, article_id: str, title: str, url: str, reason: str) -> None:
+        """记录失败条目到 fail.log（追加模式，支持断点续传）"""
+        line = (
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"step={step} | id={article_id} | "
+            f"title={title[:60]} | url={url[:80]} | "
+            f"reason={reason}\n"
+        )
+        with open(self._fail_log_path, "a", encoding="utf-8") as f:
+            f.write(line)
 
     # ================================================================
     # 内部: 数据加载
@@ -214,10 +237,14 @@ class NewsMarkdownDownloader:
     # 内部: HTTP 请求 + 内容提取
     # ================================================================
 
-    def _fetch_and_extract(self, url: str) -> Optional[str]:
-        """下载 URL 并提取正文为 Markdown 格式"""
+    def _fetch_and_extract(self, url: str) -> Tuple[Optional[str], str]:
+        """下载 URL 并提取正文为 Markdown 格式
+
+        Returns:
+            (content, error_reason) — 成功时 error_reason 为空字符串
+        """
         if not url:
-            return None
+            return None, "URL为空"
 
         try:
             time.sleep(self.delay)
@@ -229,23 +256,19 @@ class NewsMarkdownDownloader:
 
             html = resp.text
             if not html or len(html) < 200:
-                logger.debug(f"页面内容过短: {url}")
-                return None
+                return None, f"页面内容过短({len(html) if html else 0}字符)"
 
             markdown = self._html_to_markdown(html)
             if markdown and len(markdown) > 50:
-                return markdown
-            return None
+                return markdown, ""
+            return None, f"提取正文过短({len(markdown) if markdown else 0}字符)"
 
         except requests.Timeout:
-            logger.debug(f"请求超时: {url[:80]}")
-            return None
+            return None, "请求超时"
         except requests.RequestException as e:
-            logger.debug(f"请求失败 [{url[:60]}]: {e}")
-            return None
+            return None, f"请求失败: {type(e).__name__}"
         except Exception as e:
-            logger.debug(f"解析异常 [{url[:60]}]: {e}")
-            return None
+            return None, f"解析异常: {type(e).__name__}"
 
     def _html_to_markdown(self, html: str) -> str:
         """从 HTML 提取正文并转换为 Markdown"""

@@ -30,6 +30,7 @@ import re
 import json
 import logging
 import time
+import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -104,6 +105,67 @@ summary: "{根据正文生成的摘要，不超过100字}"
 - civilian: 来源是商业媒体或其他
 """
 
+# 批量清洗：每篇文章之间的分隔符
+BATCH_SEPARATOR = "\n\n---ARTICLE---\n\n"
+
+# 批量清洗系统提示词（与单篇共享清洗规则，增加输出格式说明）
+BATCH_SYSTEM_PROMPT = """你是一个专业的新闻文本清洗助手。你的任务是将爬虫下载的新闻文章整理为统一格式。
+
+## 清洗规则
+1. 删除所有非文章正文的内容：广告、导航栏、页脚、侧边栏、相关推荐、评论区、分享按钮、二维码、版权声明
+2. 删除图片说明文字（如"新华社记者 XXX 摄"、"图为XXX"）
+3. 删除记者署名行和来源重复声明
+4. 删除"查看余下全文"、"责任编辑"、"敬请关注"等网站功能文字
+5. 保留文章的正副标题、导语和全部正文段落
+6. 保持原文段落结构，不要合并段落，不要改写或缩写正文
+7. 保留原文中的直接引语和关键数据
+
+## 输出格式
+你会收到多篇新闻文章。每篇文章独立清洗，严格按以下格式输出。
+**每篇文章之间必须用分隔符 `---ARTICLE---` 隔开**（独占一行）。
+
+每篇文章的格式：
+
+---
+id: ""
+title: "{清理后的标题}"
+source: "{来源名称}"
+source_url: "{原始URL}"
+publish_date: "{YYYY-MM-DD}"
+category: "news"
+type: "text"
+country: "china"
+discourse_type: "{institutional 或 civilian}"
+keywords: ["关键词1", "关键词2"]
+development_stage: "{traditional/reform/development/poverty/precision/rural}"
+summary: "{根据正文生成的摘要，不超过100字}"
+---
+
+{正文第一段}
+
+{正文第二段}
+
+## 关键词列表
+只能从以下列表中选取文章中实际讨论的关键词：
+{keywords}
+
+## 发展阶段判断
+- traditional: 1949-1978年
+- reform: 1979-1985年
+- development: 1986-1993年
+- poverty: 1994-2012年
+- precision: 2013-2020年
+- rural: 2021年至今
+根据文章发布日期判断。
+
+## 话语类型判断
+- institutional: 来源是官方媒体（人民网、新华网、央视网、央广网、光明网、中国日报、求是等）
+- civilian: 来源是商业媒体或其他
+"""
+
+# 每批最多处理文章数
+DEFAULT_BATCH_SIZE = 10
+
 
 class LLMCleaner:
     """DeepSeek API 批量文章清洗器"""
@@ -115,6 +177,7 @@ class LLMCleaner:
         run_id: Optional[str] = None,
         delay: float = 0.5,       # API 调用间隔
         max_retries: int = 3,
+        batch_size: int = DEFAULT_BATCH_SIZE,  # 批量清洗篇数
     ):
         self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY", "") or DEEPSEEK_API_KEY
         if not self.api_key:
@@ -125,6 +188,7 @@ class LLMCleaner:
         self.model = model or DEEPSEEK_MODEL
         self.delay = delay
         self.max_retries = max_retries
+        self.batch_size = max(1, batch_size)
 
         self.client = OpenAI(
             api_key=self.api_key,
@@ -148,6 +212,7 @@ class LLMCleaner:
         self.success_count = 0
         self.fail_count = 0
         self.skip_count = 0
+        self._fail_log_path = self.data_dir / "fail.log"
 
         logger.info(f"LLM 清洗器就绪: model={self.model}, run_id={self.run_id}")
 
@@ -158,6 +223,9 @@ class LLMCleaner:
     def clean_all(self, limit: Optional[int] = None) -> Tuple[int, int, int]:
         """
         批量清洗所有已下载的 .md 文章
+
+        每 batch_size 篇文章合并为一次 API 请求，节省 system prompt 重复传输的 token。
+        单篇模式下 system prompt ~1500 token 每次都要传；批量模式下 N 篇共享一次。
 
         Args:
             limit: 限制清洗数量（测试用）
@@ -171,12 +239,17 @@ class LLMCleaner:
         with open(self.csv_path, "r", encoding="utf-8-sig") as f:
             articles = list(csv.DictReader(f))
 
-        # 只处理已下载 .md 的文章
+        # 筛选：有下载 .md 且未清洗的文章
         to_process = []
         for a in articles:
             md_path = self.articles_dir / f"{a['id']}.md"
-            if md_path.exists() and md_path.stat().st_size > 100:
-                to_process.append(a)
+            if not md_path.exists() or md_path.stat().st_size < 100:
+                continue
+            clean_path = self.clean_dir / f"{a['id']}.md"
+            if clean_path.exists() and clean_path.stat().st_size > 200:
+                self.skip_count += 1  # 断点续传：已清洗跳过
+                continue
+            to_process.append(a)
 
         if limit:
             to_process = to_process[:limit]
@@ -188,38 +261,53 @@ class LLMCleaner:
 
         self.clean_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"🤖 开始 LLM 清洗: {total} 篇 (模型: {self.model})")
+        # 预处理 system prompt（注入关键词，只需做一次）
+        keywords_str = "、".join(KEYWORDS)
+        system_prompt = BATCH_SYSTEM_PROMPT.replace("{keywords}", keywords_str)
 
-        for i, article in enumerate(to_process, 1):
-            article_id = article["id"]
-            clean_path = self.clean_dir / f"{article_id}.md"
+        batch_count = (total + self.batch_size - 1) // self.batch_size
+        logger.info(
+            f"🤖 开始 LLM 清洗: {total} 篇 → {batch_count} 批 "
+            f"(模型: {self.model}, 每批 {self.batch_size} 篇)"
+        )
+        logger.info(f"   Token 节省估算: {total}次请求 → {batch_count}次 (省 ~{(total - batch_count) * 1500} token)")
 
-            # 断点续传
-            if clean_path.exists() and clean_path.stat().st_size > 200:
-                self.skip_count += 1
-                if i % 10 == 0:
-                    logger.info(
-                        f"  进度: {i}/{total} | "
-                        f"✓{self.success_count} ✗{self.fail_count} ⊘{self.skip_count}"
-                    )
-                continue
+        # 失败日志运行头
+        with open(self._fail_log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n"
+                    f"🤖 Clean Run: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+                    f"total={total} | model={self.model} | batch_size={self.batch_size}\n"
+                    f"{'='*60}\n")
 
-            # 读取原始 .md
-            raw_path = self.articles_dir / f"{article_id}.md"
-            raw_text = raw_path.read_text(encoding="utf-8")
+        done = 0
+        for batch_idx in range(batch_count):
+            start = batch_idx * self.batch_size
+            end = min(start + self.batch_size, total)
+            batch = to_process[start:end]
 
-            # 调用 LLM 清洗
-            cleaned = self._clean_one(article, raw_text)
+            logger.debug(f"  批次 {batch_idx+1}/{batch_count}: {len(batch)} 篇")
 
-            if cleaned:
-                clean_path.write_text(cleaned, encoding="utf-8")
-                self.success_count += 1
-            else:
-                self.fail_count += 1
+            # 批量调用 LLM
+            results = self._clean_batch(batch, system_prompt)
 
-            if i % 5 == 0 or i == total:
+            # 保存结果
+            for article, (cleaned, error) in zip(batch, results):
+                article_id = article["id"]
+                clean_path = self.clean_dir / f"{article_id}.md"
+                done += 1
+
+                if cleaned:
+                    clean_path.write_text(cleaned, encoding="utf-8")
+                    self.success_count += 1
+                else:
+                    self.fail_count += 1
+                    self._log_fail("clean", article_id,
+                                   article.get("title", ""),
+                                   article.get("url", ""), error)
+
+            if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == batch_count:
                 logger.info(
-                    f"  进度: {i}/{total} | "
+                    f"  进度: {done}/{total} (批次 {batch_idx+1}/{batch_count}) | "
                     f"✓{self.success_count} ✗{self.fail_count} ⊘{self.skip_count}"
                 )
 
@@ -229,17 +317,154 @@ class LLMCleaner:
         )
         logger.info(f"清洗后文件目录: {self.clean_dir}")
 
+        if self.fail_count > 0:
+            logger.info(f"📄 失败记录: {self._fail_log_path}")
+
         # 生成数据库导入 CSV（使用 AI 清洗后的 summary）
         self._generate_db_csv()
 
         return self.success_count, self.fail_count, self.skip_count
 
     # ================================================================
-    # 内部: 单篇清洗
+    # 内部: 失败日志
     # ================================================================
 
-    def _clean_one(self, article: Dict, raw_text: str) -> Optional[str]:
-        """调用 LLM 清洗单篇文章"""
+    def _log_fail(self, step: str, article_id: str, title: str, url: str, reason: str) -> None:
+        """记录失败条目到 fail.log（追加模式）"""
+        line = (
+            f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"step={step} | id={article_id} | "
+            f"title={title[:60]} | url={url[:80]} | "
+            f"reason={reason}\n"
+        )
+        with open(self._fail_log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+    # ================================================================
+    # 内部: 批量清洗
+    # ================================================================
+
+    def _clean_batch(self, articles: List[Dict], system_prompt: str) -> List[Tuple[Optional[str], str]]:
+        """一次 API 调用清洗多篇文章
+
+        Args:
+            articles: 待清洗文章列表
+            system_prompt: 已注入关键词的系统提示词
+
+        Returns:
+            [(cleaned_text, error_reason), ...] 与 articles 一一对应
+        """
+        if len(articles) == 1:
+            # 单篇走原逻辑（输出格式无分隔符）
+            raw_path = self.articles_dir / f"{articles[0]['id']}.md"
+            raw_text = raw_path.read_text(encoding="utf-8")
+            result, err = self._clean_one(articles[0], raw_text)
+            return [(result, err)]
+
+        # 构建批量用户消息
+        parts = []
+        for i, article in enumerate(articles, 1):
+            raw_path = self.articles_dir / f"{article['id']}.md"
+            raw_text = raw_path.read_text(encoding="utf-8")
+            # 批量模式下每篇截断以控制总 token（1M上下文绰绰有余）
+            max_chars = 8000
+            if len(raw_text) > max_chars:
+                raw_text = raw_text[:max_chars] + "\n\n[文本过长，已截断]"
+
+            parts.append(f"## 文章 {i}")
+            parts.append(self._build_article_meta(article))
+            parts.append(f"\n### 原始内容\n\n{raw_text}")
+
+        user_message = (
+            f"请一次性清洗以下 {len(articles)} 篇新闻文章。\n"
+            f"每篇文章独立清洗，用分隔符 `---ARTICLE---`（独占一行）隔开。\n\n"
+            + "\n\n".join(parts)
+        )
+
+        # API 调用（含重试）
+        result_text = None
+        for attempt in range(self.max_retries):
+            try:
+                time.sleep(self.delay)
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    temperature=0.1,
+                    max_tokens=16384,
+                )
+                result_text = response.choices[0].message.content
+                if result_text and len(result_text) > 200:
+                    break
+                result_text = None
+                logger.warning(
+                    f"批量 API 返回过短 ({len(result_text) if result_text else 0} 字符)"
+                )
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    wait = (attempt + 1) * 5
+                    logger.debug(f"批量 API 错误 (重试 {attempt+1}): {e}")
+                    time.sleep(wait)
+                else:
+                    logger.error(f"批量 API 失败: {type(e).__name__}")
+                    return [(None, f"批量API失败: {type(e).__name__}")] * len(articles)
+
+        if not result_text:
+            return [(None, "批量API返回为空")] * len(articles)
+
+        return self._parse_batch_result(result_text, articles)
+
+    def _build_article_meta(self, article: Dict) -> str:
+        """构建单篇文章的元数据头"""
+        title = article.get("title", "").strip()
+        source = article.get("source", "").strip()
+        url = article.get("url", "").strip()
+        pub_date = article.get("pub_date", "").strip()
+        is_official = article.get("is_official", "")
+        discourse = "institutional" if is_official == "True" else "civilian"
+        stage_hint = self._stage_hint(pub_date)
+
+        return (
+            f"\n### 元数据\n"
+            f"- 标题: {title}\n"
+            f"- 来源: {source}\n"
+            f"- URL: {url}\n"
+            f"- 发布日期: {pub_date}\n"
+            f"- 话语类型: {discourse}\n"
+            f"{stage_hint}"
+        )
+
+    def _parse_batch_result(self, text: str, articles: List[Dict]) -> List[Tuple[Optional[str], str]]:
+        """拆分批量 API 返回结果为单篇文章
+
+        LLM 用 `---ARTICLE---` 分隔各篇文章的输出。
+        """
+        # 按分隔符拆分
+        parts = re.split(r'\n?---ARTICLE---\n?', text)
+        # 去除空白段（第一个段可能是空的）
+        parts = [p.strip() for p in parts if p.strip()]
+
+        results = []
+        for i in range(len(articles)):
+            if i < len(parts) and parts[i] and len(parts[i]) > 200:
+                results.append((parts[i], ""))
+            elif i < len(parts):
+                results.append((None,
+                    f"批量结果第{i+1}篇过短({len(parts[i])}字符)"))
+            else:
+                results.append((None,
+                    f"批量结果缺少第{i+1}篇(共解析{len(parts)}篇)"))
+
+        return results
+
+    def _clean_one(self, article: Dict, raw_text: str) -> Tuple[Optional[str], str]:
+        """调用 LLM 清洗单篇文章
+
+        Returns:
+            (cleaned_text, error_reason) — 成功时 error_reason 为空字符串
+        """
         title = article.get("title", "").strip()
         source = article.get("source", "").strip()
         url = article.get("url", "").strip()
@@ -275,13 +500,11 @@ class LLMCleaner:
 
                 result = response.choices[0].message.content
                 if result and len(result) > 100:
-                    return result
+                    return result, ""
                 else:
-                    logger.warning(
-                        f"LLM 返回内容过短 ({len(result) if result else 0} chars) "
-                        f"[{title[:30]}]"
-                    )
-                    return None
+                    err = f"LLM返回过短({len(result) if result else 0}字符)"
+                    logger.warning(f"{err} [{title[:30]}]")
+                    return None, err
 
             except Exception as e:
                 if attempt < self.max_retries - 1:
@@ -292,11 +515,9 @@ class LLMCleaner:
                     )
                     time.sleep(wait)
                 else:
-                    logger.error(
-                        f"API 失败 [{title[:30]}...]: {e}"
-                    )
-
-        return None
+                    err = f"API失败({self.max_retries}次重试): {type(e).__name__}"
+                    logger.error(f"{err} [{title[:30]}]")
+                    return None, err
 
     def _build_user_message(
         self,
