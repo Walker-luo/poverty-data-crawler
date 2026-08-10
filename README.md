@@ -104,10 +104,13 @@ python main.py --download --limit 5           # 只下载 5 篇测试
 python main.py --clean --limit 3              # 测试 3 篇
 python main.py --clean                        # 全量清洗
 python main.py --clean --run-id ID            # 指定 run
+python main.py --clean --workers 8            # 提高并发加速（默认 4）
 ```
 
 > **批量清洗节省 Token**：默认每 5 篇文章合并为一次 API 请求，System Prompt 只传一次。
 > 1000 篇文章从 1000 次请求 → 200 次，省 ~120 万 token。可通过修改 `DEFAULT_BATCH_SIZE` 调整每批篇数。
+>
+> **并发加速**：默认 4 个线程并发调用 API，速度提升 3-4 倍。若日志出现 API 限流（429）错误，降低 `--workers` 或增大 `--delay`。
 
 ### `--pipeline` 流水线
 

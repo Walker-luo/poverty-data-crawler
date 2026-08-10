@@ -33,6 +33,7 @@ import time
 import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
 from config.settings import KEYWORDS
@@ -164,7 +165,7 @@ summary: "{根据正文生成的摘要，不超过100字}"
 """
 
 # 每批最多处理文章数
-DEFAULT_BATCH_SIZE = 10
+DEFAULT_BATCH_SIZE = 5
 
 
 class LLMCleaner:
@@ -178,6 +179,7 @@ class LLMCleaner:
         delay: float = 0.5,       # API 调用间隔
         max_retries: int = 3,
         batch_size: int = DEFAULT_BATCH_SIZE,  # 批量清洗篇数
+        max_workers: int = 4,     # 并发批次数（加速清洗）
     ):
         self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY", "") or DEEPSEEK_API_KEY
         if not self.api_key:
@@ -189,6 +191,7 @@ class LLMCleaner:
         self.delay = delay
         self.max_retries = max_retries
         self.batch_size = max(1, batch_size)
+        self.max_workers = max(1, max_workers)
 
         self.client = OpenAI(
             api_key=self.api_key,
@@ -213,6 +216,7 @@ class LLMCleaner:
         self.fail_count = 0
         self.skip_count = 0
         self._fail_log_path = self.data_dir / "fail.log"
+        self._clean_cache: Dict[str, str] = {}  # 本次运行的清洗结果缓存 (文件名→文本)
 
         logger.info(f"LLM 清洗器就绪: model={self.model}, run_id={self.run_id}")
 
@@ -268,7 +272,8 @@ class LLMCleaner:
         batch_count = (total + self.batch_size - 1) // self.batch_size
         logger.info(
             f"🤖 开始 LLM 清洗: {total} 篇 → {batch_count} 批 "
-            f"(模型: {self.model}, 每批 {self.batch_size} 篇)"
+            f"(模型: {self.model}, 每批 {self.batch_size} 篇, "
+            f"并发 {self.max_workers} 批)"
         )
         logger.info(f"   Token 节省估算: {total}次请求 → {batch_count}次 (省 ~{(total - batch_count) * 1500} token)")
 
@@ -279,18 +284,33 @@ class LLMCleaner:
                     f"total={total} | model={self.model} | batch_size={self.batch_size}\n"
                     f"{'='*60}\n")
 
+        # 按 batch_size 分组
+        batches = [
+            to_process[i:i + self.batch_size]
+            for i in range(0, total, self.batch_size)
+        ]
+
+        # 并发调用 API（结果保存统一在主线程，避免并发写文件）
+        results_map: Dict[int, List[Tuple[Optional[str], str]]] = {}
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(self._clean_batch, batch, system_prompt): idx
+                for idx, batch in enumerate(batches)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results_map[idx] = future.result()
+                except Exception as e:
+                    logger.error(f"批次 {idx+1} 线程异常: {type(e).__name__}: {e}")
+                    results_map[idx] = [
+                        (None, f"线程异常: {type(e).__name__}")
+                    ] * len(batches[idx])
+
+        # 按顺序保存结果
         done = 0
-        for batch_idx in range(batch_count):
-            start = batch_idx * self.batch_size
-            end = min(start + self.batch_size, total)
-            batch = to_process[start:end]
-
-            logger.debug(f"  批次 {batch_idx+1}/{batch_count}: {len(batch)} 篇")
-
-            # 批量调用 LLM
-            results = self._clean_batch(batch, system_prompt)
-
-            # 保存结果
+        for batch_idx, batch in enumerate(batches):
+            results = results_map[batch_idx]
             for article, (cleaned, error) in zip(batch, results):
                 article_id = article["id"]
                 clean_path = self.clean_dir / f"{article_id}.md"
@@ -298,6 +318,7 @@ class LLMCleaner:
 
                 if cleaned:
                     clean_path.write_text(cleaned, encoding="utf-8")
+                    self._clean_cache[clean_path.name] = cleaned  # 缓存供 CSV 用
                     self.success_count += 1
                 else:
                     self.fail_count += 1
@@ -305,7 +326,7 @@ class LLMCleaner:
                                    article.get("title", ""),
                                    article.get("url", ""), error)
 
-            if (batch_idx + 1) % 5 == 0 or (batch_idx + 1) == batch_count:
+            if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == batch_count:
                 logger.info(
                     f"  进度: {done}/{total} (批次 {batch_idx+1}/{batch_count}) | "
                     f"✓{self.success_count} ✗{self.fail_count} ⊘{self.skip_count}"
@@ -383,6 +404,7 @@ class LLMCleaner:
 
         # API 调用（含重试）
         result_text = None
+        last_finish = ""
         for attempt in range(self.max_retries):
             try:
                 time.sleep(self.delay)
@@ -393,26 +415,52 @@ class LLMCleaner:
                         {"role": "user", "content": user_message},
                     ],
                     temperature=0.1,
-                    max_tokens=16384,
+                    max_tokens=76000,  
                 )
-                result_text = response.choices[0].message.content
-                if result_text and len(result_text) > 200:
+                choice = response.choices[0]
+                last_finish = choice.finish_reason
+                msg = choice.message
+                content = msg.content
+
+                # 诊断：content 为 None 通常是被安全过滤
+                if content is None:
+                    refusal = getattr(msg, "refusal", None)
+                    logger.warning(
+                        f"批量返回 content=None (finish_reason={last_finish}, "
+                        f"refusal={refusal})"
+                    )
+                    result_text = None
+                elif isinstance(content, str) and len(content) > 200:
+                    result_text = content
                     break
-                result_text = None
-                logger.warning(
-                    f"批量 API 返回过短 ({len(result_text) if result_text else 0} 字符)"
-                )
+                else:
+                    logger.warning(
+                        f"批量返回异常: type={type(content).__name__}, "
+                        f"len={len(content) if content else 0}, "
+                        f"finish_reason={last_finish}"
+                    )
+                    result_text = None
             except Exception as e:
                 if attempt < self.max_retries - 1:
                     wait = (attempt + 1) * 5
                     logger.debug(f"批量 API 错误 (重试 {attempt+1}): {e}")
                     time.sleep(wait)
                 else:
-                    logger.error(f"批量 API 失败: {type(e).__name__}")
-                    return [(None, f"批量API失败: {type(e).__name__}")] * len(articles)
+                    logger.error(f"批量 API 失败: {type(e).__name__}: {e}")
 
         if not result_text:
-            return [(None, "批量API返回为空")] * len(articles)
+            # 批量失败 → 回退为逐篇清洗（更稳，避免整批丢失）
+            logger.warning(
+                f"⚠️ 批量清洗失败 (finish_reason={last_finish})，"
+                f"回退为逐篇清洗 {len(articles)} 篇..."
+            )
+            results = []
+            for article in articles:
+                raw_path = self.articles_dir / f"{article['id']}.md"
+                raw_text = raw_path.read_text(encoding="utf-8")
+                cleaned, err = self._clean_one(article, raw_text)
+                results.append((cleaned, err))
+            return results
 
         return self._parse_batch_result(result_text, articles)
 
@@ -588,17 +636,26 @@ class LLMCleaner:
     # ================================================================
 
     def _generate_db_csv(self) -> None:
-        """清洗完成后，从 YAML frontmatter 生成数据库导入 CSV"""
+        """清洗完成后，从 YAML frontmatter 生成数据库导入 CSV
+
+        优先使用内存缓存（本次运行已清洗的文件），
+        仅对缓存外文件（历史 run 断点续传的）读盘，减少 I/O。
+        """
         import csv
 
         csv_path = self.clean_dir / "db_import.csv"
-        rows = []
 
-        for md_file in sorted(self.clean_dir.glob("*.md")):
+        # 合并内存缓存 + 磁盘扫描（缓存优先，避免重复读盘）
+        texts: Dict[str, str] = dict(self._clean_cache)
+        for md_file in self.clean_dir.glob("*.md"):
             if md_file.name == "db_import.csv":
                 continue
+            if md_file.name not in texts:
+                texts[md_file.name] = md_file.read_text(encoding="utf-8")
 
-            text = md_file.read_text(encoding="utf-8")
+        rows = []
+        for filename in sorted(texts):
+            text = texts[filename]
             meta = self._parse_frontmatter(text)
             if not meta:
                 continue
@@ -623,7 +680,7 @@ class LLMCleaner:
                 keywords_str = str(keywords)
 
             rows.append({
-                "*文件名": md_file.name,
+                "*文件名": filename,
                 "*标题": meta.get("title", ""),
                 "描述 / 内容": meta.get("summary", ""),
                 "*分类": meta.get("category", "news"),

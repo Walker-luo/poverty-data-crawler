@@ -240,6 +240,10 @@ def main():
         help="限制处理数量 (--download / --clean 模式测试用)",
     )
     parser.add_argument(
+        "--workers", type=int, default=4,
+        help="--clean 模式的并发批次数，默认 4（太高可能触发 API 限流）",
+    )
+    parser.add_argument(
         "--pipeline", action="store_true",
         help="一键完成: 爬取 → 下载 → LLM清洗",
     )
@@ -270,7 +274,7 @@ def main():
     if args.clean:
         from utils.llm_cleaner import LLMCleaner
         try:
-            with LLMCleaner(run_id=args.run_id) as cleaner:
+            with LLMCleaner(run_id=args.run_id, max_workers=args.workers) as cleaner:
                 cleaner.clean_all(limit=args.limit)
         except FileNotFoundError as e:
             logger.error(str(e))
@@ -397,7 +401,7 @@ def main():
         # ② LLM 清洗
         from utils.llm_cleaner import LLMCleaner
         try:
-            with LLMCleaner(run_id=run_id) as cleaner:
+            with LLMCleaner(run_id=run_id, max_workers=args.workers) as cleaner:
                 cleaner.clean_all(limit=args.limit)
         except ValueError as e:
             logger.warning(f"跳过清洗步骤: {e}")
