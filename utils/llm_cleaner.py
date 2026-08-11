@@ -224,6 +224,18 @@ class LLMCleaner:
     # 公开接口
     # ================================================================
 
+    def generate_csv(self) -> None:
+        """从已清洗的 .md 文件生成 db_import.csv（不需要 LLM）
+
+        适用于：
+          - 清洗已完成但 CSV 丢失/损坏
+          - 想用更新后的字段映射重新生成
+        """
+        csv_path = self.clean_dir / "db_import.csv"
+        if csv_path.exists():
+            logger.info(f"覆盖已有 CSV: {csv_path}")
+        self._generate_db_csv()
+
     def clean_all(self, limit: Optional[int] = None) -> Tuple[int, int, int]:
         """
         批量清洗所有已下载的 .md 文章

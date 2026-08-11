@@ -228,6 +228,10 @@ def main():
         help="LLM 清洗已下载的 .md 文章 (需设置 DEEPSEEK_API_KEY)",
     )
     parser.add_argument(
+        "--gen-csv", action="store_true",
+        help="仅从已清洗的 .md 生成 db_import.csv (不需要 LLM)",
+    )
+    parser.add_argument(
         "--run-id", type=str, default=None,
         help="指定 run_id (--download / --clean 模式)",
     )
@@ -280,6 +284,17 @@ def main():
             logger.error(str(e))
             sys.exit(1)
         except ValueError as e:
+            logger.error(str(e))
+            sys.exit(1)
+        return
+
+    # ---- 仅生成 db_import.csv（不需要 LLM） ----
+    if args.gen_csv:
+        from utils.llm_cleaner import LLMCleaner
+        try:
+            with LLMCleaner(run_id=args.run_id) as cleaner:
+                cleaner.generate_csv()
+        except FileNotFoundError as e:
             logger.error(str(e))
             sys.exit(1)
         return
