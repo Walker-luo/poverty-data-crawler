@@ -44,6 +44,10 @@ load_dotenv()  # 这行会读取 .env 文件并注入到环境变量中
 
 logger = logging.getLogger(__name__)
 
+# 关闭 OpenAI SDK 底层 httpx 的 HTTP 请求日志（太吵，我们有 📡 日志就够了）
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+
 
 # ============================================================
 # 🔑 在此填入 DeepSeek API Key（优先于环境变量）
@@ -334,57 +338,62 @@ class LLMCleaner:
         for a in long_articles:
             all_tasks.append(("single", [a]))
 
-        results_map: Dict[int, List[Tuple[Optional[str], str]]] = {}
+        completed_tasks = 0
+        total_tasks = len(all_tasks)
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {}
             for idx, (task_type, task_articles) in enumerate(all_tasks):
                 if task_type == "batch":
-                    futures[executor.submit(self._clean_batch, task_articles, system_prompt)] = idx
+                    futures[executor.submit(
+                        self._clean_batch, task_articles, system_prompt
+                    )] = idx
                 else:
-                    # 长文单独清洗（走 _clean_one，max_input=12000 更宽松）
-                    futures[executor.submit(self._clean_single_task, task_articles[0])] = idx
+                    futures[executor.submit(
+                        self._clean_single_task, task_articles[0]
+                    )] = idx
+
             for future in as_completed(futures):
                 idx = futures[future]
+                task_type, task_articles = all_tasks[idx]
                 try:
-                    results_map[idx] = future.result()
+                    results = future.result()
                 except Exception as e:
                     logger.error(f"任务 {idx+1} 线程异常: {type(e).__name__}: {e}")
-                    results_map[idx] = [
+                    results = [
                         (None, f"线程异常: {type(e).__name__}")
-                    ] * len(all_tasks[idx][1])
+                    ] * len(task_articles)
 
-        # 按顺序保存结果
-        done = 0
-        for task_idx, (task_type, task_articles) in enumerate(all_tasks):
-            results = results_map[task_idx]
-            for article, (cleaned, error) in zip(task_articles, results):
-                article_id = article["id"]
-                clean_path = self.clean_dir / f"{article_id}.md"
-                done += 1
+                # ---- 立刻保存结果并更新进度（主线程安全） ----
+                for article, (cleaned, error) in zip(task_articles, results):
+                    article_id = article["id"]
+                    clean_path = self.clean_dir / f"{article_id}.md"
 
-                if cleaned:
-                    clean_path.write_text(cleaned, encoding="utf-8")
-                    self._clean_cache[clean_path.name] = cleaned
-                    self.success_count += 1
-                else:
-                    self.fail_count += 1
-                    self._log_fail("clean", article_id,
-                                   article.get("title", ""),
-                                   article.get("url", ""), error)
+                    if cleaned:
+                        clean_path.write_text(cleaned, encoding="utf-8")
+                        self._clean_cache[clean_path.name] = cleaned
+                        self.success_count += 1
+                    else:
+                        self.fail_count += 1
+                        self._log_fail("clean", article_id,
+                                       article.get("title", ""),
+                                       article.get("url", ""), error)
 
-            total_tasks = len(all_tasks)
-            if (task_idx + 1) % 5 == 0 or (task_idx + 1) == total_tasks:
-                progress_line = (
-                    f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                    f"进度: {done}/{total} ({done*100//total}%) | "
-                    f"✓{self.success_count} ✗{self.fail_count} ⊘{self.skip_count} | "
-                    f"任务 {task_idx+1}/{total_tasks} | "
-                    f"💰 {self._format_cost()}"
-                )
-                logger.info(f"  {progress_line.split('] ', 1)[1]}")  # 终端去掉时间戳
-                # 同时写入 fail.log 供事后查看
-                with open(self._fail_log_path, "a", encoding="utf-8") as f:
-                    f.write(progress_line + "\n")
+                completed_tasks += 1
+
+                # ---- 每完成一个任务就报进度 ----
+                if completed_tasks % 5 == 0 or completed_tasks == total_tasks:
+                    done = self.success_count + self.fail_count
+                    progress_line = (
+                        f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"进度: {done}/{total} ({done*100//total}%) | "
+                        f"✓{self.success_count} ✗{self.fail_count} ⊘{self.skip_count} | "
+                        f"任务 {completed_tasks}/{total_tasks} | "
+                        f"💰 {self._format_cost()}"
+                    )
+                    logger.info(f"  {progress_line.split('] ', 1)[1]}")
+                    with open(self._fail_log_path, "a", encoding="utf-8") as f:
+                        f.write(progress_line + "\n")
 
         logger.info(
             f"✅ LLM 清洗完成: {total} 篇 | "
