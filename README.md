@@ -180,6 +180,32 @@ python main.py --show-fails --run-id ID        # 查看指定 run 的 fail.log
 
 fail.log 文件位于 `data/processed/news/{run_id}/fail.log`，下载和清洗共享同一文件，追加写入不覆盖。
 
+### `check_csv_coverage.py` 检查 CSV 收录完整性
+
+独立于 main.py 的诊断脚本，对比 `db_import.csv` 与 `clean/` 目录，找出清洗了但未收录进 CSV 的文件，并加上 `000_` 前缀标记，方便定位坏文件。
+
+```bash
+python3 check_csv_coverage.py                          # 最新 run
+python3 check_csv_coverage.py --run-id ID              # 指定 run
+python3 check_csv_coverage.py --dry-run                # 预览，不实际重命名
+python3 check_csv_coverage.py --print-missing          # 只打印缺失清单
+python3 check_csv_coverage.py --restore                # 撤销 000_ 前缀
+python3 check_csv_coverage.py --repair                 # 自动修复缺失 --- 的 frontmatter
+```
+
+**工作原理**：`db_import.csv` 生成时（`--gen-csv` / `--clean`）会解析每个 `clean/*.md` 的 YAML frontmatter，解析失败（frontmatter 结构损坏）的文件不会进入 CSV。脚本找出这些"有文件但没进 CSV"的篇目，重命名为 `000_xxx.md` 便于查看。
+
+**典型输出**：
+
+```
+📄 db_import.csv 收录: 4271 篇
+📁 clean/ 目录文件: 4280 个 .md
+============================================================
+⚠️ 缺失 9 篇（clean/ 有文件但 CSV 未收录）:
+  a1b2c3d4e5f6a1b2.md (3402 bytes)
+  ...
+```
+
 ### `--fetch-content` / `--output-db`
 
 旧版功能，已不推荐使用。`--output-db` 输出 MongoDB 导入格式（resource.json）。
@@ -400,6 +426,7 @@ CRAWL_CONFIG = {
 ```
 poverty/
 ├── main.py                   # 主入口 (爬取/下载/清洗)
+├── check_csv_coverage.py     # 检查 db_import.csv 收录完整性 (独立脚本)
 ├── requirements.txt          # Python 依赖
 ├── config/
 │   └── settings.py           # 媒体分类(48个) / 关键词 / 采集规则
@@ -458,6 +485,42 @@ tmux kill-session -t crawler  # 结束会话
 2. 过滤太严？→ 试试 `--filter all`
 3. 翻页深度不够？→ 加大 `--max-pages`
 4. 日志中是否有 `跳过 xxx (连续 3 年无结果)` 的冷词跳过信息？
+
+### db_import.csv 缺文章（YAML frontmatter 损坏）
+
+**现象**：清洗完成了，但 `db_import.csv` 收录数 < `clean/` 目录下 .md 数。
+
+**原因**：CSV 生成时解析每篇的 YAML frontmatter（`---...---`），**解析失败的文件会被跳过**。常见失败形态：
+1. 文件不以 `---` 开头 — LLM 输出前加了前言文字
+2. 没有闭合的 `---` — LLM 只输出了半个 frontmatter
+3. 字段用中文冒号 `：` — 解析只认 ASCII `:`
+4. 文件过短（<200 字节）— LLM 中途截断
+
+**排查与修复**：
+
+```bash
+# ① 找出缺失文件并加 000_ 前缀标记（便于识别）
+python3 check_csv_coverage.py --run-id ID
+
+# ② 自动修复缺失 --- 的 frontmatter（推荐，不花 LLM 费用）
+#    自动定位 YAML 字段块重新包裹 ---，并恢复 000_ 前缀文件的原文件名
+python3 check_csv_coverage.py --repair --run-id ID
+#    下一步重新生成 CSV
+python main.py --gen-csv --run-id ID
+
+# ③ 若 --repair 报"找不到 YAML 字段行"，说明不是缺 --- 而是输出损坏，
+#    手动打开 000_*.md 检查；或用 --restore 撤销标记后让 LLM 重新清洗：
+python3 check_csv_coverage.py --restore
+python main.py --clean --run-id ID
+```
+
+**`--repair` 修复范围**：
+- 自动定位 `id:`/`title:`/.../`summary:` 字段块（跳过 LLM 加的前言文字、字段间空行）
+- 重新包上 `---` 分隔符，字段块后的内容视为正文
+- 修复成功的文件自动恢复原文件名（去掉 `000_` 前缀）
+- 无法识别的文件保留原样并报告，不会破坏数据
+
+**注意**：重跑 `--clean` 只清洗被 `000_` 标记的篇目（其原文件名在 clean/ 已不存在），其余正常文件自动跳过。清洗成功后删除残留的 `000_*` 文件即可。
 
 ### 日志排查
 
