@@ -373,11 +373,18 @@ class LLMCleaner:
                                    article.get("url", ""), error)
 
             total_tasks = len(all_tasks)
-            if (task_idx + 1) % 10 == 0 or (task_idx + 1) == total_tasks:
-                logger.info(
-                    f"  进度: {done}/{total} (任务 {task_idx+1}/{total_tasks}) | "
-                    f"✓{self.success_count} ✗{self.fail_count} ⊘{self.skip_count}"
+            if (task_idx + 1) % 5 == 0 or (task_idx + 1) == total_tasks:
+                progress_line = (
+                    f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"进度: {done}/{total} ({done*100//total}%) | "
+                    f"✓{self.success_count} ✗{self.fail_count} ⊘{self.skip_count} | "
+                    f"任务 {task_idx+1}/{total_tasks} | "
+                    f"💰 {self._format_cost()}"
                 )
+                logger.info(f"  {progress_line.split('] ', 1)[1]}")  # 终端去掉时间戳
+                # 同时写入 fail.log 供事后查看
+                with open(self._fail_log_path, "a", encoding="utf-8") as f:
+                    f.write(progress_line + "\n")
 
         logger.info(
             f"✅ LLM 清洗完成: {total} 篇 | "
@@ -507,6 +514,7 @@ class LLMCleaner:
         )
 
         # API 调用（含重试）
+        t_start = time.time()
         result_text = None
         last_finish = ""
         for attempt in range(self.max_retries):
@@ -519,7 +527,7 @@ class LLMCleaner:
                         {"role": "user", "content": user_message},
                     ],
                     temperature=0.1,
-                    max_tokens=76000,  
+                    max_tokens=76000,
                 )
                 choice = response.choices[0]
                 last_finish = choice.finish_reason
@@ -554,6 +562,23 @@ class LLMCleaner:
                     time.sleep(wait)
                 else:
                     logger.error(f"批量 API 失败: {type(e).__name__}: {e}")
+
+        if result_text:
+            results = self._parse_batch_result(result_text, articles)
+            success = sum(1 for r, _ in results if r)
+            fail = len(results) - success
+            elapsed = time.time() - t_start
+            tk_in = getattr(response, 'usage', None)
+            tk_in_val = tk_in.prompt_tokens if tk_in else 0
+            tk_out_val = tk_in.completion_tokens if tk_in else 0
+            titles = ", ".join(a.get("title", "")[:20] for a in articles[:3])
+            if len(articles) > 3:
+                titles += f" ...等{len(articles)}篇"
+            logger.info(
+                f"📡 批量API: {len(articles)}篇 | ✓{success} ✗{fail} | "
+                f"入{tk_in_val}tk 出{tk_out_val}tk | {elapsed:.1f}s | {titles}"
+            )
+            return results
 
         if not result_text:
             # 批量失败 → 回退为逐篇清洗（更稳，避免整批丢失）
@@ -643,6 +668,7 @@ class LLMCleaner:
         for attempt in range(self.max_retries):
             try:
                 time.sleep(self.delay)
+                t_start = time.time()
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
@@ -656,7 +682,15 @@ class LLMCleaner:
                 self._track_usage(response)
 
                 result = response.choices[0].message.content
+                tk_usage = response.usage
+                elapsed = time.time() - t_start
                 if result and len(result) > 100:
+                    logger.info(
+                        f"📡 单篇API: {title[:40]} | "
+                        f"入{tk_usage.prompt_tokens if tk_usage else '?'}tk "
+                        f"出{tk_usage.completion_tokens if tk_usage else '?'}tk "
+                        f"| {elapsed:.1f}s"
+                    )
                     return result, ""
                 else:
                     err = f"LLM返回过短({len(result) if result else 0}字符)"
