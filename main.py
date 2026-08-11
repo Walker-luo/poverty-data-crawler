@@ -232,6 +232,10 @@ def main():
         help="仅从已清洗的 .md 生成 db_import.csv (不需要 LLM)",
     )
     parser.add_argument(
+        "--dry-run", action="store_true",
+        help="清洗测试: 先处理1篇文章验证API连通性，再处理3篇验证批量",
+    )
+    parser.add_argument(
         "--run-id", type=str, default=None,
         help="指定 run_id (--download / --clean 模式)",
     )
@@ -274,7 +278,38 @@ def main():
             sys.exit(1)
         return
 
-    # ---- LLM 清洗模式: 清洗已下载的 .md 文章 ----
+    # ---- LLM 清洗测试模式: 先验证 API 连通性再批量 ----
+    if args.dry_run:
+        from utils.llm_cleaner import LLMCleaner
+        logger.info("=" * 50)
+        logger.info("🧪 清洗测试模式: 验证 API 连通性和批量处理")
+        logger.info("=" * 50)
+        try:
+            # Step 1: 单篇测试
+            logger.info("📝 Step 1/2: 单篇清洗测试...")
+            with LLMCleaner(run_id=args.run_id, max_workers=1) as cleaner:
+                cleaner.clean_all(limit=1)
+            logger.info("✅ 单篇测试通过")
+            logger.info("")
+
+            # Step 2: 批量测试
+            logger.info("📦 Step 2/2: 批量清洗测试 (3篇)...")
+            with LLMCleaner(run_id=args.run_id, max_workers=1) as cleaner:
+                cleaner.clean_all(limit=3)
+            logger.info("✅ 批量测试通过")
+            logger.info("")
+
+            logger.info("=" * 50)
+            logger.info("✅ 测试全部通过，可以正式清洗:")
+            logger.info(f"   python main.py --clean --run-id {args.run_id or 'XXX'} --workers {args.workers}")
+            logger.info("=" * 50)
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            sys.exit(1)
+        except ValueError as e:
+            logger.error(f"❌ API配置错误: {e}")
+            sys.exit(1)
+        return
     if args.clean:
         from utils.llm_cleaner import LLMCleaner
         try:

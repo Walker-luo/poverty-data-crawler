@@ -98,7 +98,7 @@ python main.py --download --limit 5           # 只下载 5 篇测试
 
 ### `--clean` LLM 清洗
 
-调用 DeepSeek API 将下载的 `.md` 清洗为统一模板格式。需先运行爬虫或在 [utils/llm_cleaner.py](utils/llm_cleaner.py) 第 43 行填入 API Key。
+调用 DeepSeek API 将下载的 `.md` 清洗为统一模板格式。需先在 [utils/llm_cleaner.py](utils/llm_cleaner.py) 的 `DEEPSEEK_API_KEY` 变量或环境变量中填入 API Key。
 
 ```bash
 python main.py --clean --limit 3              # 测试 3 篇
@@ -107,10 +107,34 @@ python main.py --clean --run-id ID            # 指定 run
 python main.py --clean --workers 8            # 提高并发加速（默认 4）
 ```
 
-> **批量清洗节省 Token**：默认每 5 篇文章合并为一次 API 请求，System Prompt 只传一次。
-> 1000 篇文章从 1000 次请求 → 200 次，省 ~120 万 token。可通过修改 `DEFAULT_BATCH_SIZE` 调整每批篇数。
+> **批量清洗节省 Token**：默认每 5 篇文章合并为一次 API 请求，System Prompt 只传一次。1000 篇从 1000 次请求 → 200 次，省 ~120 万 token。
 >
-> **并发加速**：默认 4 个线程并发调用 API，速度提升 3-4 倍。若日志出现 API 限流（429）错误，降低 `--workers` 或增大 `--delay`。
+> **并发加速**：默认 4 个线程并发调用 API，速度提升 3-4 倍。若日志出现 API 限流（429），降低 `--workers` 或增大 `--delay`。
+>
+> **失败回退**：批量请求失败时自动回退为逐篇清洗，不会整批丢弃。
+>
+> **费用透明**：每次 API 调用自动统计 token 用量，日志实时显示累计费用 `💰 费用统计: 50次调用, 入 1500tk, 出 450tk, ≈¥0.45`。
+
+### `--dry-run` 清洗前验证
+
+正式清洗前先跑测试，验证 API 连通性和批量处理是否正常。
+
+```bash
+python main.py --dry-run --run-id ID
+```
+
+流程：先单篇测试（1 篇）→ 再批量测试（3 篇）→ 输出验证结果和后续指令。1-2 分钟完成。
+
+### `--gen-csv` 仅生成导入 CSV
+
+从已清洗的 `.md` 文件生成 `db_import.csv`，**不需要调用 LLM**，仅解析 YAML frontmatter。
+
+```bash
+python main.py --gen-csv                        # 最新 run
+python main.py --gen-csv --run-id ID            # 指定 run
+```
+
+适用于：清洗完成但 CSV 丢失、想更新字段映射后重新导出。
 
 ### `--pipeline` 流水线
 
@@ -123,7 +147,7 @@ python main.py --pipeline --source news --strategy maximize --engine bing --limi
 
 ### `--run-id` 指定数据目录
 
-不指定时自动选择最新的 `run_id`。适用于 `--download` 和 `--clean` 模式。
+不指定时自动选择最新的 `run_id`。适用于 `--download`、`--clean`、`--gen-csv`、`--dry-run`、`--show-fails` 模式。
 
 ### `--delay` 请求间隔
 
@@ -131,7 +155,7 @@ python main.py --pipeline --source news --strategy maximize --engine bing --limi
 
 ### `--limit` 限制数量
 
-限制 `--download` 或 `--clean` 模式下的处理数量，测试用。
+限制 `--download` 或 `--clean` 模式下的处理数量，测试用。**清洗测试推荐用 `--dry-run` 替代**（自动验证单篇+批量）。
 
 ### `--show-fails` 查看失败日志
 
@@ -170,6 +194,11 @@ python main.py --pipeline --source news --strategy maximize --engine bing
 
 自动完成 爬取 → 下载正文 → LLM 清洗。
 
+> ⚠️ **首次使用建议先验证清洗**：
+> ```bash
+> python main.py --dry-run --run-id 你的runid    # 1-2分钟验证 API 正常
+> ```
+
 ### 分步执行
 
 ```bash
@@ -179,9 +208,14 @@ python main.py --source news --strategy maximize --engine bing
 # ② 下载正文
 python main.py --download
 
-# ③ LLM 清洗（先测试，后全量）
-python main.py --clean --limit 3    # 测试 3 篇
-python main.py --clean               # 全量清洗
+# ③ 清洗前验证（推荐）
+python main.py --dry-run
+
+# ④ LLM 清洗
+python main.py --clean --workers 4
+
+# ⑤ 查看失败记录
+python main.py --show-fails
 ```
 
 ## 数据规模预估
@@ -210,21 +244,23 @@ Phase 3: Top 10 官媒 site: 定向 (兜底)
 
 ### Bing 引擎 (三阶段，推荐)
 
-三阶段，覆盖 15 关键词 × 48 年逐年分区：
+两套关键词 + 2000-2026 年逐层采集：
 
 ```
-Phase 1 (主力): 15 关键词 × 48 年逐年搜索
-        → Bing 新闻不支持年份过滤，靠翻页深度覆盖
-        → 自动去重，统计官媒占比
+Phase 1 (主力): 10通用词 × 27年 (2000-2026) 逐年翻页搜索
+        → 使用 BROAD_KEYWORDS（扶贫、脱贫、减贫、贫困...）
+        → 年份外循环 + 关键词内循环，每年一行进度
+        → 连续5年无结果自动剪枝，停止该关键词
+        → 翻页至 max_pages，空页/全重复自动 break
 
-Phase 2 (补齐): 关键词 + 最近2年搜索
-        → 以年份字符串拼入搜索词捕获遗漏
-        → 翻页深度减半，控制请求量
+Phase 2 (补齐): 通用词 + 最近2年搜索
+        → 捕获 Phase1 遗漏，翻页深度减半
 
-Phase 3 (兜底): 核心官媒点名搜索
-        → 前12个中央级官媒 × 前2个高频关键词
-        → Bing 不支持 site: 语法，改用"来源名+关键词"组合
-        → 只翻第1页，补齐官媒覆盖
+Phase 3 (兜底): 48官媒 × 15政策词 点名搜索
+        → 使用 POLICY_KEYWORDS（含建档立卡、两不愁三保障等专业术语）
+        → Bing 不支持 site: 语法，改用 "来源名+关键词" 组合
+        → 翻页至 max_pages//2
+        → 效率最高：~9.5条/请求 vs Phase1 的 ~1.6条/请求
 ```
 
 ## 数据字段
@@ -275,13 +311,14 @@ data/processed/news/{run_id}/
 ├── news.csv              ← 爬虫原始字段
 ├── news.json             ← 同上 JSON 格式
 ├── summary.md            ← 统计报告
+├── fail.log              ← 下载+清洗失败记录 (自动生成的诊断文件)
 ├── articles/             ← 下载的原文 .md (--download)
 │   ├── a1b2c3d4.md
 │   ├── e5f6g7h8.md
-│   ├── db_import.csv     ← 数据库批量导入索引
 │   └── clean/            ← LLM 清洗后 .md (--clean)
 │       ├── a1b2c3d4.md   ← 统一模板格式
-│       └── e5f6g7h8.md
+│       ├── e5f6g7h8.md
+│       └── db_import.csv ← 数据库批量导入索引 (--gen-csv 或 --clean 自动生成)
 └── resource.json         ← MongoDB 导入 (--output-db)
 ```
 

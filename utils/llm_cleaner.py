@@ -217,6 +217,9 @@ class LLMCleaner:
         self.skip_count = 0
         self._fail_log_path = self.data_dir / "fail.log"
         self._clean_cache: Dict[str, str] = {}  # 本次运行的清洗结果缓存 (文件名→文本)
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._api_calls = 0
 
         logger.info(f"LLM 清洗器就绪: model={self.model}, run_id={self.run_id}")
 
@@ -236,11 +239,17 @@ class LLMCleaner:
             logger.info(f"覆盖已有 CSV: {csv_path}")
         self._generate_db_csv()
 
+    # 长文章阈值：超过此字符数的文章不走批量，单独清洗（避免截断丢失信息）
+    LONG_ARTICLE_THRESHOLD = 8000
+
     def clean_all(self, limit: Optional[int] = None) -> Tuple[int, int, int]:
         """
         批量清洗所有已下载的 .md 文章
 
-        每 batch_size 篇文章合并为一次 API 请求，节省 system prompt 重复传输的 token。
+        按文章长度分流：
+        - 短文章（≤8000字符）→ 批量处理，每 batch_size 篇合并为一次 API 请求
+        - 长文章（>8000字符）→ 单独清洗，max_input=12000，全文不截断
+
         单篇模式下 system prompt ~1500 token 每次都要传；批量模式下 N 篇共享一次。
 
         Args:
@@ -255,7 +264,7 @@ class LLMCleaner:
         with open(self.csv_path, "r", encoding="utf-8-sig") as f:
             articles = list(csv.DictReader(f))
 
-        # 筛选：有下载 .md 且未清洗的文章
+        # 筛选：有下载 .md 且未清洗的文章，同时读取原始文本长度
         to_process = []
         for a in articles:
             md_path = self.articles_dir / f"{a['id']}.md"
@@ -265,6 +274,10 @@ class LLMCleaner:
             if clean_path.exists() and clean_path.stat().st_size > 200:
                 self.skip_count += 1  # 断点续传：已清洗跳过
                 continue
+            # 预读原始文本长度，供分流判断
+            raw_text = md_path.read_text(encoding="utf-8")
+            a["_raw_text"] = raw_text
+            a["_raw_len"] = len(raw_text)
             to_process.append(a)
 
         if limit:
@@ -277,60 +290,81 @@ class LLMCleaner:
 
         self.clean_dir.mkdir(parents=True, exist_ok=True)
 
+        # ---- 按字数分流 ----
+        batch_articles = [a for a in to_process if a["_raw_len"] <= self.LONG_ARTICLE_THRESHOLD]
+        long_articles = [a for a in to_process if a["_raw_len"] > self.LONG_ARTICLE_THRESHOLD]
+
+        batch_total = len(batch_articles)
+        long_total = len(long_articles)
+        batch_count = (batch_total + self.batch_size - 1) // self.batch_size if batch_total else 0
+
         # 预处理 system prompt（注入关键词，只需做一次）
         keywords_str = "、".join(KEYWORDS)
         system_prompt = BATCH_SYSTEM_PROMPT.replace("{keywords}", keywords_str)
 
-        batch_count = (total + self.batch_size - 1) // self.batch_size
         logger.info(
-            f"🤖 开始 LLM 清洗: {total} 篇 → {batch_count} 批 "
-            f"(模型: {self.model}, 每批 {self.batch_size} 篇, "
-            f"并发 {self.max_workers} 批)"
+            f"🤖 开始 LLM 清洗: {total} 篇 "
+            f"(批量 {batch_total} 篇 → {batch_count} 批 + 长文单独 {long_total} 篇)"
         )
-        logger.info(f"   Token 节省估算: {total}次请求 → {batch_count}次 (省 ~{(total - batch_count) * 1500} token)")
+        logger.info(f"   模型: {self.model}, 每批 {self.batch_size} 篇, 并发 {self.max_workers}")
+        if batch_count:
+            logger.info(
+                f"   Token 节省估算 (批量部分): "
+                f"{batch_total}次请求 → {batch_count}次 "
+                f"(省 ~{(batch_total - batch_count) * 1500} token)"
+            )
+        if long_total:
+            logger.info(f"   长文阈值: >{self.LONG_ARTICLE_THRESHOLD}字符，单独清洗以保留全文")
 
         # 失败日志运行头
         with open(self._fail_log_path, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*60}\n"
                     f"🤖 Clean Run: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-                    f"total={total} | model={self.model} | batch_size={self.batch_size}\n"
+                    f"total={total} (batch={batch_total}, long={long_total}) | "
+                    f"model={self.model} | batch_size={self.batch_size}\n"
                     f"{'='*60}\n")
 
-        # 按 batch_size 分组
-        batches = [
-            to_process[i:i + self.batch_size]
-            for i in range(0, total, self.batch_size)
-        ]
+        # ---- 并发处理：批量任务 + 长文单独任务 ----
+        all_tasks: List[Tuple[str, List[Dict]]] = []  # (task_type, articles)
 
-        # 并发调用 API（结果保存统一在主线程，避免并发写文件）
+        # 批量任务
+        for i in range(0, batch_total, self.batch_size):
+            all_tasks.append(("batch", batch_articles[i:i + self.batch_size]))
+        # 长文单独任务（每篇一个任务）
+        for a in long_articles:
+            all_tasks.append(("single", [a]))
+
         results_map: Dict[int, List[Tuple[Optional[str], str]]] = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {
-                executor.submit(self._clean_batch, batch, system_prompt): idx
-                for idx, batch in enumerate(batches)
-            }
+            futures = {}
+            for idx, (task_type, task_articles) in enumerate(all_tasks):
+                if task_type == "batch":
+                    futures[executor.submit(self._clean_batch, task_articles, system_prompt)] = idx
+                else:
+                    # 长文单独清洗（走 _clean_one，max_input=12000 更宽松）
+                    futures[executor.submit(self._clean_single_task, task_articles[0])] = idx
             for future in as_completed(futures):
                 idx = futures[future]
                 try:
                     results_map[idx] = future.result()
                 except Exception as e:
-                    logger.error(f"批次 {idx+1} 线程异常: {type(e).__name__}: {e}")
+                    logger.error(f"任务 {idx+1} 线程异常: {type(e).__name__}: {e}")
                     results_map[idx] = [
                         (None, f"线程异常: {type(e).__name__}")
-                    ] * len(batches[idx])
+                    ] * len(all_tasks[idx][1])
 
         # 按顺序保存结果
         done = 0
-        for batch_idx, batch in enumerate(batches):
-            results = results_map[batch_idx]
-            for article, (cleaned, error) in zip(batch, results):
+        for task_idx, (task_type, task_articles) in enumerate(all_tasks):
+            results = results_map[task_idx]
+            for article, (cleaned, error) in zip(task_articles, results):
                 article_id = article["id"]
                 clean_path = self.clean_dir / f"{article_id}.md"
                 done += 1
 
                 if cleaned:
                     clean_path.write_text(cleaned, encoding="utf-8")
-                    self._clean_cache[clean_path.name] = cleaned  # 缓存供 CSV 用
+                    self._clean_cache[clean_path.name] = cleaned
                     self.success_count += 1
                 else:
                     self.fail_count += 1
@@ -338,9 +372,10 @@ class LLMCleaner:
                                    article.get("title", ""),
                                    article.get("url", ""), error)
 
-            if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == batch_count:
+            total_tasks = len(all_tasks)
+            if (task_idx + 1) % 10 == 0 or (task_idx + 1) == total_tasks:
                 logger.info(
-                    f"  进度: {done}/{total} (批次 {batch_idx+1}/{batch_count}) | "
+                    f"  进度: {done}/{total} (任务 {task_idx+1}/{total_tasks}) | "
                     f"✓{self.success_count} ✗{self.fail_count} ⊘{self.skip_count}"
                 )
 
@@ -353,10 +388,21 @@ class LLMCleaner:
         if self.fail_count > 0:
             logger.info(f"📄 失败记录: {self._fail_log_path}")
 
+        logger.info(f"💰 费用统计: {self._format_cost()}")
+
         # 生成数据库导入 CSV（使用 AI 清洗后的 summary）
         self._generate_db_csv()
 
         return self.success_count, self.fail_count, self.skip_count
+
+    def _clean_single_task(self, article: Dict) -> List[Tuple[Optional[str], str]]:
+        """单个长文章清洗任务（供 ThreadPoolExecutor 调用）"""
+        raw_text = article.get("_raw_text", "")
+        if not raw_text:
+            raw_path = self.articles_dir / f"{article['id']}.md"
+            raw_text = raw_path.read_text(encoding="utf-8")
+        result, err = self._clean_one(article, raw_text)
+        return [(result, err)]
 
     # ================================================================
     # 内部: 失败日志
@@ -373,45 +419,91 @@ class LLMCleaner:
         with open(self._fail_log_path, "a", encoding="utf-8") as f:
             f.write(line)
 
+    def _track_usage(self, response) -> None:
+        """从 API 响应中累计 token 用量"""
+        if hasattr(response, "usage") and response.usage:
+            self._total_input_tokens += response.usage.prompt_tokens or 0
+            self._total_output_tokens += response.usage.completion_tokens or 0
+        self._api_calls += 1
+
+    def _format_cost(self) -> str:
+        """格式化累计 token 和估算费用"""
+        # DeepSeek Flash 参考定价: input ~0.14 ¥/M, output ~0.55 ¥/M
+        cost = (self._total_input_tokens / 1e6 * 0.14
+                + self._total_output_tokens / 1e6 * 0.55)
+        return (
+            f"{self._api_calls}次调用, "
+            f"入 {self._total_input_tokens}tk, "
+            f"出 {self._total_output_tokens}tk, "
+            f"≈¥{cost:.2f}"
+        )
+
     # ================================================================
     # 内部: 批量清洗
     # ================================================================
 
     def _clean_batch(self, articles: List[Dict], system_prompt: str) -> List[Tuple[Optional[str], str]]:
-        """一次 API 调用清洗多篇文章
+        """一次 API 调用清洗多篇文章（仅用于短文章，≤8000字符）
 
         Args:
-            articles: 待清洗文章列表
+            articles: 待清洗文章列表（已预读 _raw_text）
             system_prompt: 已注入关键词的系统提示词
 
         Returns:
             [(cleaned_text, error_reason), ...] 与 articles 一一对应
         """
         if len(articles) == 1:
-            # 单篇走原逻辑（输出格式无分隔符）
-            raw_path = self.articles_dir / f"{articles[0]['id']}.md"
-            raw_text = raw_path.read_text(encoding="utf-8")
+            raw_text = articles[0].get("_raw_text", "")
+            if not raw_text:
+                raw_path = self.articles_dir / f"{articles[0]['id']}.md"
+                raw_text = raw_path.read_text(encoding="utf-8")
             result, err = self._clean_one(articles[0], raw_text)
             return [(result, err)]
 
-        # 构建批量用户消息
+        # 构建批量用户消息（无需截断，分流时已确保都是短文章）
         parts = []
+        total_chars = 0
         for i, article in enumerate(articles, 1):
-            raw_path = self.articles_dir / f"{article['id']}.md"
-            raw_text = raw_path.read_text(encoding="utf-8")
-            # 批量模式下每篇截断以控制总 token（1M上下文绰绰有余）
-            max_chars = 8000
-            if len(raw_text) > max_chars:
-                raw_text = raw_text[:max_chars] + "\n\n[文本过长，已截断]"
+            raw_text = article.get("_raw_text", "")
+            if not raw_text:
+                raw_path = self.articles_dir / f"{article['id']}.md"
+                raw_text = raw_path.read_text(encoding="utf-8")
+            total_chars += len(raw_text)
 
             parts.append(f"## 文章 {i}")
             parts.append(self._build_article_meta(article))
             parts.append(f"\n### 原始内容\n\n{raw_text}")
 
+        # 安全兜底：所有文章总长度超限时做段落感知截断
+        if total_chars > 30000:
+            logger.warning(
+                f"批量总长度 {total_chars} 字符，触发安全截断"
+            )
+            # 对每篇文章按比例缩容
+            budget_per_article = 25000 // len(articles)
+            for i in range(len(parts)):
+                if parts[i].startswith("### 原始内容"):
+                    raw = parts[i].replace("### 原始内容\n\n", "")
+                    if len(raw) > budget_per_article:
+                        # 在段落边界截断，保留首部
+                        cutoff = raw.rfind("\n\n", 0, budget_per_article)
+                        if cutoff > budget_per_article // 2:
+                            raw = raw[:cutoff]
+                        else:
+                            raw = raw[:budget_per_article]
+                        raw += "\n\n[文本过长，已截断]"
+                    parts[i] = f"### 原始内容\n\n{raw}"
+
         user_message = (
             f"请一次性清洗以下 {len(articles)} 篇新闻文章。\n"
             f"每篇文章独立清洗，用分隔符 `---ARTICLE---`（独占一行）隔开。\n\n"
             + "\n\n".join(parts)
+        )
+
+        # 诊断日志
+        logger.debug(
+            f"批量请求: {len(articles)} 篇, "
+            f"总长度 {len(user_message)} 字符 (~{len(user_message)//4} tokens)"
         )
 
         # API 调用（含重试）
@@ -433,6 +525,9 @@ class LLMCleaner:
                 last_finish = choice.finish_reason
                 msg = choice.message
                 content = msg.content
+
+                # 累计 token 用量
+                self._track_usage(response)
 
                 # 诊断：content 为 None 通常是被安全过滤
                 if content is None:
@@ -557,6 +652,8 @@ class LLMCleaner:
                     temperature=0.1,        # 低温度保证一致性
                     max_tokens=8192,
                 )
+
+                self._track_usage(response)
 
                 result = response.choices[0].message.content
                 if result and len(result) > 100:
