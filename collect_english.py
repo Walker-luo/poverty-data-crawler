@@ -92,6 +92,41 @@ CHINA_SPECIFIC = {
     "health poverty alleviation",
 }
 
+# ============================================================
+# 关键词分组 — 用 --group N 每天手动选择爬哪一组
+# 每天爬一组（每组仅 3 词），配合 --resume-run 去重，避免额度浪费
+# 每组 3 词 × --max-pages 5 ≈ 15 次请求，远低于 $1/天 (1000次)
+# ============================================================
+KEYWORD_GROUPS = {
+    1: [  # 核心战略（3 词）
+        "targeted poverty alleviation",
+        "rural revitalization",
+        "poverty governance",
+    ],
+    2: [  # 共同富裕 + 脱贫攻坚（3 词）
+        "common prosperity",
+        "battle against poverty",
+        "multidimensional poverty",
+    ],
+    3: [  # 易地搬迁 + 产业扶贫（3 词）
+        "relocation for poverty alleviation",
+        "industrial poverty alleviation",
+        "educational poverty alleviation",
+    ],
+    4: [  # 健康扶贫 + 通用（3 词）
+        "health poverty alleviation",
+        "poverty alleviation",
+        "poverty reduction",
+    ],
+    5: [  # 减贫学术（3 词）
+        "poverty eradication",
+        "absolute poverty",
+        "poverty trap",
+    ],
+}
+# 状态文件：记录每组最近采集时间（在 academic 根目录，跨 run 持久）
+GROUP_STATUS_FILE = Path("data/processed/academic/group_status.json")
+
 MAILTO = "unknownluo7@gmail.com"  # polite pool 标识，建议改成你的真实邮箱
 PER_PAGE = 200                     # 单页条数
 REQUEST_DELAY = 0.2                # 请求间隔秒数（礼貌爬取）
@@ -173,7 +208,7 @@ class OpenAlexSource:
         "topics", "referenced_works", "related_works",
         "abstract_inverted_index", "primary_location",
         "sustainable_development_goals", "open_access",
-        "referenced_works_count",
+        "referenced_works_count", "relevance_score",
     ])
 
     def __init__(self, session: requests.Session, mailto: str, delay: float,
@@ -185,10 +220,21 @@ class OpenAlexSource:
         self.name = "openalex"
 
     def search(self, keyword: str, year_filter: str, has_abstract: bool,
-               limit: Optional[int], china_specific: bool) -> List[Dict]:
-        """按关键词检索（分页）"""
+               limit: Optional[int], china_specific: bool,
+               max_pages: Optional[int] = None,
+               min_relevance: Optional[float] = None) -> List[Dict]:
+        """按关键词检索（分页）
+
+        Args:
+            max_pages: 每关键词最大翻页数（硬上限，防额度失控）。
+            min_relevance: 相关性触底阈值。OpenAlex search 按相关性排序，
+                relevance 低于该值的连续结果都是噪声 → 自动停止翻页。
+                用绝对值分数（实测: 首页median≈420, 第5页≈153, 第11页≈101）。
+                这样翻页深度由数据质量决定，把高相关元数据都挖完。
+        """
         results = []
         cursor = "*"
+        pages_done = 0
         filters = [f"language:en", f"publication_year:{year_filter}"]
         if has_abstract:
             filters.append("has_abstract:true")
@@ -197,6 +243,8 @@ class OpenAlexSource:
 
         while True:
             if limit and len(results) >= limit:
+                break
+            if max_pages and pages_done >= max_pages:
                 break
             params = {
                 "search": query,
@@ -212,13 +260,30 @@ class OpenAlexSource:
             batch = data.get("results", [])
             if not batch:
                 break
-            results.extend(batch)
+            # relevance 触底：页内按相关性递减，一旦低于阈值即停止（后续只会更低）
+            if min_relevance:
+                kept = []
+                stopped = False
+                for r in batch:
+                    if r.get("relevance_score", 0) < min_relevance:
+                        stopped = True
+                        break
+                    kept.append(r)
+                results.extend(kept)
+                if stopped:
+                    logger.info(f"    '{keyword}' 相关性触底(<{min_relevance})"
+                                f"停止翻页, 已爬 {pages_done+1} 页")
+                    break
+            else:
+                results.extend(batch)
+            pages_done += 1
             next_cursor = data.get("meta", {}).get("next_cursor")
             if not next_cursor:
                 break
             cursor = next_cursor
             time.sleep(self.delay)
-        return results[:limit] if limit else results
+        return results if max_pages is None else results[:min(
+            len(results), max_pages * PER_PAGE)]
 
     def _request(self, params: Dict) -> Optional[Dict]:
         # 带 API key 可提升额度（免费 $0.1/天 → 带 key $1/天，约10倍）
@@ -257,6 +322,7 @@ class OpenAlexSource:
             "keywords": self._extract_keywords(work),
             "references": [w.split("/")[-1] for w in work.get("referenced_works", [])],
             "source_api": "openalex",
+            "relevance": round(work.get("relevance_score", 0), 1),
             "is_oa": bool(work.get("open_access", {}).get("is_oa", False)),
             "oa_url": (work.get("best_oa_location") or {}).get("pdf_url", "")
                        or (work.get("open_access") or {}).get("oa_url", ""),
@@ -322,7 +388,9 @@ class CrossrefSource:
         self.name = "crossref"
 
     def search(self, keyword: str, year_filter: str, has_abstract: bool,
-               limit: Optional[int], china_specific: bool) -> List[Dict]:
+               limit: Optional[int], china_specific: bool,
+               max_pages: Optional[int] = None,
+               min_relevance: Optional[float] = None) -> List[Dict]:
         """按关键词检索（offset 分页，无限量）
 
         注意：Crossref 的 cursor 分页与 query.title 冲突（会导致标题检索失效），
@@ -330,12 +398,15 @@ class CrossrefSource:
         """
         results = []
         offset = 0
+        pages_done = 0
         y_from, y_to = year_filter.split("-")
         # 通用词加 China 限定（标题须同时含关键词和 China）
         query = keyword if china_specific else f"{keyword} China"
 
         while True:
             if limit and len(results) >= limit:
+                break
+            if max_pages and pages_done >= max_pages:
                 break
             params = {
                 # 标题精准检索（全文 query 噪音太大，会混入无关文献）
@@ -355,11 +426,14 @@ class CrossrefSource:
             if not items:
                 break
             results.extend(items)
+            pages_done += 1
             total = msg.get("total-results", 0)
             offset += len(items)
             if offset >= total or not items:
                 break
             time.sleep(self.delay)
+        if max_pages is not None:
+            results = results[:max_pages * 200]
         return results[:limit] if limit else results
 
     def _request(self, params: Dict) -> Optional[Dict]:
@@ -414,6 +488,7 @@ class CrossrefSource:
             "keywords": [],
             "references": references,
             "source_api": "crossref",
+            "relevance": 0,
             "is_oa": False,
             "oa_url": "",
         }
@@ -425,12 +500,19 @@ class CrossrefSource:
 class AcademicCollector:
     def __init__(self, source: str = "openalex", mailto: str = MAILTO,
                  delay: float = REQUEST_DELAY, api_key: str = "",
-                 run_id: Optional[str] = None):
+                 run_id: Optional[str] = None,
+                 resume_run: Optional[str] = None,
+                 max_pages: Optional[int] = None,
+                 min_relevance: Optional[float] = None):
         self.mailto = mailto
         self.delay = delay
         self.api_key = api_key or OPENALEX_API_KEY
         self.session = requests.Session()
         self.session.headers["User-Agent"] = f"poverty-research/1.0 (mailto:{mailto})"
+        self.resume_run = resume_run
+        self.max_pages = max_pages
+        self.min_relevance = min_relevance
+        self.used_groups: List[int] = []
 
         # 按 source 组装数据源顺序
         self.sources = []
@@ -455,6 +537,38 @@ class AcademicCollector:
             return json.load(f)
 
     @staticmethod
+    def _load_group_status() -> Dict:
+        """读取关键词组使用状态 {组号: 最近采集时间}"""
+        if GROUP_STATUS_FILE.exists():
+            try:
+                with open(GROUP_STATUS_FILE, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def print_group_status(self) -> None:
+        """打印关键词组使用状态（供每日选择组别参考）"""
+        status = self._load_group_status()
+        logger.info("🗂 关键词组使用状态:")
+        for g in sorted(KEYWORD_GROUPS):
+            kws = KEYWORD_GROUPS[g]
+            last = status.get(str(g))
+            label = f"✅ 上次 {last}" if last else "⬜ 未采集"
+            logger.info(f"   组{g} ({len(kws)}词: {', '.join(kws[:3])}...)"
+                        f" {label}")
+
+    def _save_group_status(self, groups: List[int], run_id: str) -> None:
+        """更新关键词组使用状态（记录最近采集时间 + 对应 run_id）"""
+        status = self._load_group_status()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        for g in groups:
+            status[str(g)] = f"{now} (run {run_id})"
+        GROUP_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(GROUP_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
     def _dedup_key(item: Dict) -> str:
         """提取文献去重键：小写裸 DOI 优先，缺失则用 id（OpenAlex W ID）
 
@@ -471,13 +585,31 @@ class AcademicCollector:
             return doi
         return (item.get("id") or "").strip()
 
-    def _load_seen_keys(self) -> set:
-        """扫描已有 run 的 works.json，收集已采集文献的 DOI/id
+    def _load_seen_keys(self, resume_run: Optional[str] = None) -> set:
+        """收集已采集文献的 DOI/id，作为本次采集的去重基准
 
-        实现跨 run 去重：额度限制分多天爬时，第二天跳过昨天已采集的文献。
+        Args:
+            resume_run: 指定从哪个 run 续爬（只跳过该 run 已采集的文献）；
+                        否则扫描全部历史 run。
         """
         academic_dir = Path("data/processed/academic")
         keys = set()
+
+        # 指定 run：只读取该 run
+        if resume_run:
+            target = academic_dir / resume_run / "works.json"
+            if not target.exists():
+                raise SystemExit(f"续爬基准不存在: {target}")
+            with open(target, encoding="utf-8") as f:
+                for w in json.load(f):
+                    key = self._dedup_key(w)
+                    if key:
+                        keys.add(key)
+            logger.info(f"🔄 续爬基准: {resume_run} 已采集 "
+                        f"{len(keys)} 个去重键")
+            return keys
+
+        # 未指定：扫描全部历史 run
         if not academic_dir.exists():
             return keys
         for run_dir in sorted(academic_dir.iterdir(), reverse=True):
@@ -500,21 +632,36 @@ class AcademicCollector:
     def collect_all(self, keywords: Optional[List[str]] = None,
                     years: Optional[List[int]] = None,
                     has_abstract: bool = False,
-                    limit: Optional[int] = None) -> List[Dict]:
-        keywords = keywords or ENGLISH_KEYWORDS
+                    limit: Optional[int] = None,
+                    group: Optional[List[int]] = None) -> List[Dict]:
+        # 指定关键词组 → 用组内关键词；否则用传入或全部内置
+        if group:
+            selected = []
+            for g in group:
+                if g not in KEYWORD_GROUPS:
+                    raise SystemExit(f"无效组号 {g}，可选 {sorted(KEYWORD_GROUPS)}")
+                selected.extend(KEYWORD_GROUPS[g])
+                if g not in self.used_groups:
+                    self.used_groups.append(g)
+            keywords = list(dict.fromkeys(selected))
+        elif keywords is None:
+            keywords = ENGLISH_KEYWORDS
+
         years = years or list(range(2000, datetime.now().year + 1))
         year_filter = f"{min(years)}-{max(years)}"
 
+        group_hint = f" | 组 {self.used_groups}" if self.used_groups else ""
         logger.info("=" * 60)
         logger.info(f"📚 学术文献采集 | 源: {[s.name for s in self.sources]} | "
-                    f"关键词 {len(keywords)} 个 | 年份 {year_filter}")
+                    f"关键词 {len(keywords)} 个 | 年份 {year_filter}{group_hint}")
         logger.info("=" * 60)
 
         all_works = []
         # 跨 run 查重：加载历史已采集的 DOI/id，避免额度分天爬取时重复
-        seen_ids = self._load_seen_keys()
+        seen_ids = self._load_seen_keys(self.resume_run)
         if seen_ids:
-            logger.info(f"🔄 已加载历史去重键 {len(seen_ids)} 个 "
+            scope = f"指定 run {self.resume_run} 的" if self.resume_run else "历史"
+            logger.info(f"🔄 已加载{scope}去重键 {len(seen_ids)} 个 "
                         f"（跨 run 跳过已采集文献）")
 
         # 逐源采集
@@ -524,7 +671,8 @@ class AcademicCollector:
                 china_specific = kw in CHINA_SPECIFIC
                 try:
                     works = source.search(kw, year_filter, has_abstract, limit,
-                                          china_specific)
+                                          china_specific, self.max_pages,
+                                          self.min_relevance)
                 except BudgetExhausted:
                     logger.warning(
                         f"⚠️ OpenAlex 今日免费额度用完($0.1)，"
@@ -587,6 +735,11 @@ class AcademicCollector:
                 writer.writerow({k: row.get(k, "") for k in csv_fields})
         logger.info(f"📊 CSV: {csv_path} ({len(works)} 条)")
 
+        # 先更新组状态，再生成 summary（让 summary 显示最新累计状态）
+        if self.used_groups:
+            self._save_group_status(self.used_groups, self.run_id)
+            logger.info(f"🗂 已更新组状态: 组 {self.used_groups} → {self.run_id}")
+
         self._generate_summary(works)
 
     def _generate_summary(self, works: List[Dict]) -> None:
@@ -602,15 +755,31 @@ class AcademicCollector:
 
         has_abs = sum(1 for w in works if w.get("abstract"))
         has_ref = sum(1 for w in works if w.get("references"))
+        has_oa = sum(1 for w in works if w.get("is_oa"))
+
+        # 本次采集的关键词组
+        if self.used_groups:
+            group_desc = ", ".join(
+                f"组{g}({len(KEYWORD_GROUPS[g])}词)" for g in self.used_groups)
+        else:
+            group_desc = "全部"
+
+        # 全套组使用状态（从状态文件读取）
+        status = self._load_group_status()
+        status_desc = "；".join(
+            f"组{g}: {status.get(str(g), '未采集')}" for g in sorted(KEYWORD_GROUPS))
 
         lines = [
             "# 英文学术文献采集报告", "",
             f"- 采集时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"- Run ID: {self.run_id}",
+            f"- 关键词组: {group_desc}",
             f"- 文献总数: {len(works)}",
             f"- 数据源: {by_source}",
             f"- 有摘要: {has_abs} ({has_abs*100//max(1,len(works))}%)",
             f"- 有引用关系: {has_ref}",
+            f"- 可下载全文(OA): {has_oa} ({has_oa*100//max(1,len(works))}%)",
+            "", f"- 组别使用状态: {status_desc}",
             "", "## 年份分布", "",
         ]
         for y in sorted(year_dist, reverse=True):
@@ -757,6 +926,13 @@ def main():
     parser.add_argument("--years", nargs="+", type=int, default=None)
     parser.add_argument("--has-abstract", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--max-pages", type=int, default=None,
+                        help="每关键词最大翻页数(每页200条)。OpenAlex 按相关性排序，"
+                             "限制深度避免额度耗在无关深页")
+    parser.add_argument("--min-relevance", type=float, default=None,
+                        help="相关性触底阈值(OpenAlex)。relevance 低于该值的噪声"
+                             "结果自动停止翻页，把高相关元数据挖完。"
+                             "参考: 首页median≈420, 第5页≈153, 第11页≈101")
     parser.add_argument("--mailto", default=MAILTO)
     parser.add_argument("--api-key", default="",
                         help="OpenAlex API key（全文下载用，免费注册 openalex.org/users）")
@@ -765,11 +941,17 @@ def main():
                         help="采集后下载全文: grobid-xml(结构化,主题建模推荐) | pdf | none")
     parser.add_argument("--run-id", type=str, default=None,
                         help="复用已有 run 的数据（读取其 works.json 下载全文，不重新采集）")
+    parser.add_argument("--resume-run", type=str, default=None,
+                        help="从指定 run 继续采集: 仅跳过该 run 已采集的文献去重")
+    parser.add_argument("--group", type=int, nargs="+", default=None,
+                        help="指定关键词组号(1-3)，如 --group 1 或 --group 1 2。"
+                             "不指定则爬全部内置关键词")
     args = parser.parse_args()
 
     collector = AcademicCollector(
         source=args.source, mailto=args.mailto, api_key=args.api_key,
-        run_id=args.run_id,
+        run_id=args.run_id, resume_run=args.resume_run,
+        max_pages=args.max_pages, min_relevance=args.min_relevance,
     )
 
     # ---- 复用已有 run：只下载全文 ----
@@ -782,9 +964,14 @@ def main():
             logger.info("   提示: 加 --fulltext grobid-xml 可下载全文")
         return
 
+    # 指定关键词组时，先显示各组使用状态供参考
+    if args.group:
+        collector.print_group_status()
+
     works = collector.collect_all(
         keywords=args.keywords, years=args.years,
         has_abstract=args.has_abstract, limit=args.limit,
+        group=args.group,
     )
     if works:
         collector.save(works)

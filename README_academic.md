@@ -23,6 +23,59 @@ python collect_english.py --source crossref
 python collect_english.py --limit 2
 ```
 
+## 常用命令
+
+### 建库推荐流程：每天一个关键词组（5 天一轮）
+
+OpenAlex 默认主源，`--min-relevance` 相关性触底自动停。每天一组，约 15-45 次请求，$1/天额度仅用 1.5-4.5%。
+
+```bash
+# 第1天: 组1 核心战略           第2天: 组2 共同富裕+攻坚
+python collect_english.py --group 1 --min-relevance 100
+python collect_english.py --group 2 --min-relevance 100
+
+# 第3天: 组3 产业/领域          第4天: 组4 健康+通用
+python collect_english.py --group 3 --min-relevance 100
+python collect_english.py --group 4 --min-relevance 100
+
+# 第5天: 组5 减贫学术
+python collect_english.py --group 5 --min-relevance 100
+```
+
+跑完 5 天一轮后，隔一段时间再轮转一遍补充新文献（跨 run 自动去重，只付新增费用）。
+
+### 全量采集（一次性，不分组）
+
+额度充足或想一次跑完时，用 OpenAlex 全量爬取全部 15 词，结束后再用 Crossref 无限量补充（跨 run 自动去重，Crossref 不会重复采集 OpenAlex 已有的 DOI）：
+
+```bash
+# ① OpenAlex 全量爬取元数据（15 词，--min-relevance 相关性触底自动停）
+python collect_english.py --source openalex --min-relevance 100
+
+# ② OpenAlex 结束后，Crossref 补充（无限量，标题精准检索，自动跳过已采的 DOI）
+python collect_english.py --source crossref --max-pages 5
+```
+
+> **说明**：OpenAlex 字段最全（摘要/概念/引用），Crossref 无限量但几乎无摘要。
+> 两者按 DOI 去重合并，先 OpenAlex 后 Crossref，最终数据是两者的并集。
+> 若 OpenAlex 额度不够一次跑完 15 词，用 `--group N` 分几天跑，最后再跑一次 Crossref 全量补齐。
+
+### 其他常用
+
+```bash
+# ① 建库前小批量测试（先验证 API 和检索正常）
+python collect_english.py --source crossref --keywords "targeted poverty alleviation" --limit 5 --max-pages 1
+
+# ② 查看组状态（运行前自动打印各组已采集情况）
+python collect_english.py --group 1
+
+# ③ 采集 + 下载全文（grobid-xml 主题建模语料）
+python collect_english.py --group 1 --min-relevance 100 --fulltext grobid-xml
+
+# ④ 对已有 run 补下载全文（不重新采集）
+python collect_english.py --run-id <RUN_ID> --fulltext grobid-xml
+```
+
 ## 环境准备
 
 ```bash
@@ -98,6 +151,131 @@ python collect_english.py --source openalex --has-abstract
 python collect_english.py --limit 2    # 每个关键词限 2 条，快速验证
 ```
 
+### `--max-pages` 限制翻页深度（防额度失控）
+
+**重要**：OpenAlex 的 `search` 是全库相关性匹配，不限制翻页时一个关键词可能翻几百页（如 "poverty alleviation" 命中 12 万条 → 595 页）。
+且 search **按相关性排序，高相关文献集中在前几页**，深页全是只含 "poverty" 一个词的弱相关边缘结果，对"中国扶贫"主题无价值，却消耗大量额度。
+
+```bash
+# 每关键词最多翻 5 页（5×200=1000 条/关键词，覆盖高相关部分）
+python collect_english.py --max-pages 5
+
+# 每关键词 1 页（200 条，快，实测 1 秒采到 81 条高相关）
+python collect_english.py --max-pages 1
+```
+
+**额度估算**（15 关键词全量）：
+
+| 场景 | 请求数 | 说明 |
+|------|--------|------|
+| 不带 max-pages | ~8800 次 ≈ 9 天额度 | 失控，深页全是无关结果 |
+| `--max-pages 5` | ~75 次 | 高相关全覆盖，1 天额度富余 |
+| `--max-pages 1` | ~15 次 | 最快，只取相关性最高的 |
+
+**建议**：全量建库用 `--max-pages 5`；日常增量/测试用 `--max-pages 1-2`。
+
+### `--min-relevance` 相关性触底自动停（额度用足且不浪费）
+
+**最佳策略**：不固定翻页数，而是让 OpenAlex 的 `relevance_score` 决定深度 —— 
+翻页直到相关性低于阈值自动停止，把**高相关元数据都挖完**（额度花在刀刃上），弱相关噪声不采。
+
+```bash
+# 强相关词自动挖深（实测 targeted poverty alleviation → 3页 +465条）
+# 弱相关词自动浅爬（实测 poverty dynamics → 1页 +32条）
+python collect_english.py --min-relevance 100
+```
+
+relevance_score 参考值（实测 "targeted poverty alleviation China"）：
+
+| 页码 | 相关性范围 | 数据质量 |
+|------|-----------|---------|
+| 第1-2页 | 260-1876 | 高相关（直接命中中国扶贫） |
+| 第3-5页 | 150-230 | 相关（边界但可用） |
+| 第6-11页 | 96-150 | 边际（部分相关） |
+| 12页后 | <96 | 噪声（扩散到全球贫困/测量工具） |
+
+**推荐用法**：
+
+| 需求 | 命令 | 预期 |
+|------|------|------|
+| 挖高相关为主 | `--min-relevance 150` | 每词爬到第5页左右 |
+| 平衡深度 | `--min-relevance 100` | 每词爬到第11页左右 |
+| 尽量多采 | `--min-relevance 60` | 挖到噪声边缘 |
+| 硬保护 | 配合 `--max-pages 20` | relevance 触底或 20 页先到先停 |
+
+**两个参数结合**：`--max-pages` 是硬上限（防失控），`--min-relevance` 是质量软停止。两者先到先停，互不冲突。建议日常 `--min-relevance 100` 就不需要固定的 max-pages 约束。
+
+### `--group` 分组采集（按天分批，防重复扣额）
+
+内置 15 个关键词分为 **5 组，每组仅 3 词**，每天手动选择爬哪一组，配合跨 run 去重避免额度浪费：
+
+```bash
+python collect_english.py --group 1      # 只爬组1（3 词）
+python collect_english.py --group 4 5    # 爬组4 + 组5
+```
+
+| 组号 | 关键词 | 主题 |
+|------|--------|------|
+| **组1** | targeted poverty alleviation、rural revitalization、poverty governance | 核心战略 |
+| **组2** | common prosperity、battle against poverty、multidimensional poverty | 共同富裕 + 脱贫攻坚 |
+| **组3** | relocation / industrial / educational poverty alleviation | 易地搬迁 + 产业 + 教育 |
+| **组4** | health poverty alleviation、poverty alleviation、poverty reduction | 健康扶贫 + 通用 |
+| **组5** | poverty eradication、absolute poverty、poverty trap | 减贫学术概念 |
+
+每组 3 词 × `--max-pages 5` = **15 次请求**，仅占当日额度的 1.5%，$1/天额度完全无压力。
+
+**组使用状态自动记录**（`data/processed/academic/group_status.json`）：
+
+- 运行前打印各组状态 → 看到哪些组已采集、哪些待爬：
+
+```
+🗂 关键词组使用状态:
+   组1 (3词: ...) ✅ 上次 2026-08-28 12:39 (run 20260828_123907)
+   组2 (3词: ...) ⬜ 未采集
+   组3 (3词: ...) ⬜ 未采集
+   组4 (3词: ...) ⬜ 未采集
+   组5 (3词: ...) ⬜ 未采集
+```
+
+- 采集成功后更新状态文件，并在 `summary.md` 记录（本次组别 + 全部组累计状态）
+
+> **注意**：若修改了分组定义（如增减组数/词），旧 `group_status.json` 记录会失真，建议删除该文件重置状态。
+
+### `--group` 与 `--source` 的关系（正交，互不影响）
+
+**不需要**——`--source` 默认就是 `openalex`，`--group 1` 不加 `--source` 即用 OpenAlex 爬组1。
+
+两者是**独立正交**的两个维度，任意组合：
+
+```bash
+# --source 默认就是 openalex，无需显式写
+python collect_english.py --group 1                    # OpenAlex 爬组1（默认）
+python collect_english.py --group 1 --source crossref  # 改用 Crossref 爬组1
+python collect_english.py --group 1 --source all       # OpenAlex 为主，额度用完切 Crossref
+```
+
+| 组合 | 效果 | 适用 |
+|------|------|------|
+| `--group 1` | OpenAlex 爬组1（**默认**） | ✅ 推荐，字段最全（摘要/概念/引用） |
+| `--group 1 --source all` | OpenAlex 先爬，额度用完自动切 Crossref 补齐 | 每组都想数据最多的场景 |
+| `--group 1 --source crossref` | 只用 Crossref 爬组1 | 无摘要也无妨，无限量兜底 |
+| `--source openalex` | 不加 `--group`，爬全部 15 词 | 一轮全量 |
+
+**结论**：
+- 想用 OpenAlex（默认推荐）→ 只写 `--group N` 即可，**无需加 `--source`**
+- 只有想切到 Crossref 或 all 时才显式写 `--source`
+
+**推荐连爬**（一天一组，OpenAlex 主源 + 相关性触底自动停）：
+
+```bash
+# 第1天 ~ 第5天，每天一组，每组 3 词 × 3-15 页 ≈ 9-45 次请求
+python collect_english.py --group 1 --min-relevance 100   # 第1天
+python collect_english.py --group 2 --min-relevance 100   # 第2天
+python collect_english.py --group 3 --min-relevance 100   # 第3天
+python collect_english.py --group 4 --min-relevance 100   # 第4天
+python collect_english.py --group 5 --min-relevance 100   # 第5天
+```
+
 ### `--fulltext` 下载全文
 
 | 值 | 说明 |
@@ -129,15 +307,31 @@ python collect_english.py --source openalex --fulltext grobid-xml
 python collect_english.py --run-id 20260826_190330 --fulltext grobid-xml
 ```
 
+### `--resume-run` 指定续爬基准
+
+采集模式下，**只跳过指定 run 已采集的文献**（区别于默认扫描全部历史 run），适合从某一天/某个专题继续定向增量采集：
+
+```bash
+# 从 run 20260827_130902 继续采集，仅跳过该 run 的文献
+python collect_english.py --resume-run 20260827_130902
+```
+
+不指定时默认扫描全部历史 run 去重。
+
 ## 查重机制
 
 | 场景 | 机制 |
 |------|------|
 | **单次运行内**（OpenAlex vs Crossref 重叠） | 按 DOI 去重 |
-| **跨 run**（第二天续爬） | 自动扫描历史 run 的 works.json，跳过已采集的 DOI |
+| **跨 run**（第二天续爬） | 默认扫描历史 run 的 works.json，跳过已采集的 DOI |
+| **指定续爬基准** | `--resume-run <ID>` 只跳过指定 run 的文献 |
 
 ```bash
-python collect_english.py --source openalex   # 明天重跑，自动跳过昨天已采的文献
+# 默认：明天重跑，自动跳过所有历史 run 已采的文献
+python collect_english.py --source openalex
+
+# 指定基准：只从某 run 续爬（仅跳过该 run 的文献）
+python collect_english.py --source openalex --resume-run 20260827_130902
 ```
 
 **要点**：
@@ -170,6 +364,7 @@ data/processed/academic/{run_id}/
 | `abstract` | **摘要（已清洗为纯文本）** | ~50%（OpenAlex）/ 低频（Crossref） |
 | `references` | 引用关系（**知识图谱的边**，W ID 列表） | ~92% |
 | `cited_by_count` | 被引次数 | 100% |
+| `relevance` | **OpenAlex 相关性分数**（越高越相关，排序/筛选依据） | OpenAlex 100% / Crossref 0 |
 | `doi` / `id` | DOI / OpenAlex W ID | 96% / 100% |
 | `is_oa` / `oa_url` | 是否开放获取 / 全文链接 | 34%（仅 OA 文献） |
 | `source_api` | 数据来源（openalex/crossref） | 100% |
@@ -184,25 +379,6 @@ Crossref 的摘要为 **JATS XML 格式**（含 `<jats:p>`、`<jats:sec>` 等标
 ```
 
 剥离全部标签 + 解码 HTML 实体 + 合并空白 + 剔除 "Abstract/Purpose" 等小标题。
-
-## 常用命令
-
-```bash
-# ① 小批量测试（推荐先跑）
-python collect_english.py --source crossref --keywords "targeted poverty alleviation" --limit 5
-
-# ② 正式采集（OpenAlex 主源，额度用完切 Crossref）
-python collect_english.py
-
-# ③ 采集 + 下载全文
-python collect_english.py --source openalex --fulltext grobid-xml
-
-# ④ 对已有 run 补下载全文（不重新采集）
-python collect_english.py --run-id <RUN_ID> --fulltext grobid-xml
-
-# ⑤ 明天续爬（自动跳过已采集的）
-python collect_english.py --source openalex
-```
 
 ## 数据规模参考
 
