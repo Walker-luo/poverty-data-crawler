@@ -130,6 +130,8 @@ GROUP_STATUS_FILE = Path("data/processed/academic/group_status.json")
 MAILTO = "unknownluo7@gmail.com"  # polite pool 标识，建议改成你的真实邮箱
 PER_PAGE = 200                     # 单页条数
 REQUEST_DELAY = 0.2                # 请求间隔秒数（礼貌爬取）
+# Crossref offset 分页上限（超过返回 400 Bad Request，必须主动停止）
+CROSSREF_OFFSET_LIMIT = 10000
 
 # OpenAlex 全文下载 API（content API）
 # 免费注册获取 key: https://openalex.org/users
@@ -300,6 +302,27 @@ class OpenAlexSource:
         resp.raise_for_status()
         return resp.json()
 
+    def get_by_ids(self, ids: List[str]) -> List[Dict]:
+        """按 OpenAlex W ID 批量查询文献（引文扩展用）
+
+        filter=ids.openalex:W1|W2|... 一次查多个 ID，分批避免 URL 过长。
+        """
+        results = []
+        BATCH = 50
+        for i in range(0, len(ids), BATCH):
+            batch = ids[i:i + BATCH]
+            params = {
+                "filter": "ids.openalex:" + "|".join(batch),
+                "per-page": PER_PAGE,
+                "mailto": self.mailto,
+                "select": self.SELECT_FIELDS,
+            }
+            data = self._request(params)
+            if data:
+                results.extend(data.get("results", []))
+            time.sleep(self.delay)
+        return results
+
     def normalize(self, work: Dict) -> Dict:
         primary = work.get("primary_location") or {}
         source = primary.get("source") or {}
@@ -408,6 +431,13 @@ class CrossrefSource:
                 break
             if max_pages and pages_done >= max_pages:
                 break
+            # Crossref offset 上限保护（超过 10000 返回 400，提前停止避免崩溃）
+            if offset >= CROSSREF_OFFSET_LIMIT:
+                logger.info(
+                    f"    '{keyword}' 结果超 {CROSSREF_OFFSET_LIMIT} 条，"
+                    f"达到 Crossref offset 上限，停止翻页（已爬 {pages_done} 页）"
+                )
+                break
             params = {
                 # 标题精准检索（全文 query 噪音太大，会混入无关文献）
                 "query.title": query,
@@ -441,6 +471,10 @@ class CrossrefSource:
         if resp.status_code == 429:
             logger.warning(f"Crossref 限流(429)，等待 10s...")
             time.sleep(10)
+            return None
+        # 400 通常是 offset 触顶，返回 None 让上层停止（配合 offset 上限保护）
+        if resp.status_code in (400, 404):
+            logger.warning(f"Crossref 请求失败(HTTP {resp.status_code})，停止翻页")
             return None
         resp.raise_for_status()
         return resp.json()
@@ -522,11 +556,11 @@ class AcademicCollector:
         if source in ("crossref", "all"):
             self.sources.append(CrossrefSource(self.session, mailto, delay))
 
-        # run_id 已存在 → 复用其目录（用于对已有数据下载全文），否则新建
-        self.run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        # run_id → 复用其目录（下载全文用）
+        # resume_run → 续爬并写回该 run 目录（数据累积在同一文件夹）
+        self.run_id = run_id or resume_run or datetime.now().strftime("%Y%m%d_%H%M%S")
         self.out_dir = Path(f"data/processed/academic/{self.run_id}")
-        if not run_id:
-            self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
 
     def load_run(self) -> List[Dict]:
         """读取已有 run 的 works.json"""
@@ -645,7 +679,9 @@ class AcademicCollector:
                     self.used_groups.append(g)
             keywords = list(dict.fromkeys(selected))
         elif keywords is None:
+            # 全量采集内置全部关键词 → 视为 5 个组都已覆盖
             keywords = ENGLISH_KEYWORDS
+            self.used_groups = list(KEYWORD_GROUPS.keys())
 
         years = years or list(range(2000, datetime.now().year + 1))
         year_filter = f"{min(years)}-{max(years)}"
@@ -709,8 +745,99 @@ class AcademicCollector:
         logger.info(f"✅ 采集完成: {len(all_works)} 条英文文献")
         return all_works
 
+    def expand_from_references(self, works: List[Dict],
+                               expand_limit: Optional[int] = None) -> List[Dict]:
+        """从已采文献的引用列表扩展采集（引文追踪）
+
+        收集所有 references 的 OpenAlex W ID → 批量查询 → 相关性过滤 → 去重。
+        用于关键词检索后，把已采文献引用链上的相关文献也拉进来。
+
+        Args:
+            expand_limit: 最多扩展的引用 W ID 数（默认全部）。
+                已采文献引用常达几十万条，全量扩展会耗尽额度且大量无关，
+                建议设置上限（如 500-2000），只扩展一部分高质量引用。
+
+        Returns:
+            扩展采集到的新文献列表
+        """
+        openalex_src = next(
+            (s for s in self.sources if s.name == "openalex"), None)
+        if not openalex_src:
+            raise SystemExit("引文扩展需要 OpenAlex 源 (--source openalex 或 all)")
+
+        # 1. 收集所有引用的 W ID
+        ref_ids = set()
+        for w in works:
+            for rid in w.get("references", []):
+                if isinstance(rid, str) and rid.startswith("W"):
+                    ref_ids.add(rid)
+        if not ref_ids:
+            logger.warning("已采文献没有可用的引用关系（W ID）")
+            return []
+        # 限制扩展规模
+        total_refs = len(ref_ids)
+        if expand_limit and len(ref_ids) > expand_limit:
+            ref_ids = set(sorted(ref_ids)[:expand_limit])
+        logger.info(f"📎 已采文献引用 {total_refs} 个 W ID"
+                    f"（扩展上限 {expand_limit or '全部'}），开始引文扩展...")
+
+        # 2. 批量查询
+        raw_results = openalex_src.get_by_ids(sorted(ref_ids))
+        logger.info(f"   OpenAlex 命中 {len(raw_results)} 篇引用文献")
+
+        # 3. 相关性过滤 + 去重
+        seen_ids = self._load_seen_keys()
+        expanded = []
+        for w in raw_results:
+            title = (w.get("title") or w.get("display_name") or "").strip()
+            if not title:
+                continue
+            # 标题须含任一内置关键词的主题词（证明主题相关）
+            if not any(is_relevant(title, kw) for kw in ENGLISH_KEYWORDS):
+                continue
+            # 只命中通用主题词（如单纯 poverty）时，需标题含 China 才放行
+            t = title.lower()
+            if "china" not in t and "chinese" not in t:
+                hit_china_kw = any(
+                    is_relevant(title, kw) for kw in CHINA_SPECIFIC)
+                if not hit_china_kw:
+                    continue
+            key = self._dedup_key(w)
+            if key and key in seen_ids:
+                continue
+            if key:
+                seen_ids.add(key)
+            expanded.append(openalex_src.normalize(w))
+
+        logger.info(f"📎 引文扩展完成: 新增 {len(expanded)} 篇相关文献")
+        return expanded
+
     def save(self, works: List[Dict]) -> None:
         json_path = self.out_dir / "works.json"
+
+        # --resume-run 续爬 / 引文扩展写回：与原数据合并去重，而非覆盖
+        if json_path.exists():
+            try:
+                existing = json.loads(json_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = []
+            seen = {self._dedup_key(w) for w in existing if self._dedup_key(w)}
+            merged = list(existing)
+            new_cnt = 0
+            for w in works:
+                key = self._dedup_key(w)
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                merged.append(w)
+                new_cnt += 1
+            works = merged
+            logger.info(
+                f"🔗 合并原 run {len(existing)} 条 + 新增 {new_cnt} 条"
+                f" = 累计 {len(works)} 条"
+            )
+
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(works, f, ensure_ascii=False, indent=2)
         logger.info(f"📄 JSON: {json_path} ({len(works)} 条)")
@@ -719,7 +846,7 @@ class AcademicCollector:
             "id", "doi", "title", "publication_year", "publication_date",
             "type", "journal", "cited_by_count", "referenced_works_count",
             "abstract", "authors", "institutions", "concepts", "keywords",
-            "landing_page_url", "source_api", "is_oa", "oa_url",
+            "relevance", "landing_page_url", "source_api", "is_oa", "oa_url",
         ]
         csv_path = self.out_dir / "works.csv"
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -758,11 +885,13 @@ class AcademicCollector:
         has_oa = sum(1 for w in works if w.get("is_oa"))
 
         # 本次采集的关键词组
-        if self.used_groups:
+        if self.used_groups and sorted(self.used_groups) == sorted(KEYWORD_GROUPS):
+            group_desc = f"全部(组{min(KEYWORD_GROUPS)}-{max(KEYWORD_GROUPS)})"
+        elif self.used_groups:
             group_desc = ", ".join(
                 f"组{g}({len(KEYWORD_GROUPS[g])}词)" for g in self.used_groups)
         else:
-            group_desc = "全部"
+            group_desc = "自定义"
 
         # 全套组使用状态（从状态文件读取）
         status = self._load_group_status()
@@ -944,8 +1073,14 @@ def main():
     parser.add_argument("--resume-run", type=str, default=None,
                         help="从指定 run 继续采集: 仅跳过该 run 已采集的文献去重")
     parser.add_argument("--group", type=int, nargs="+", default=None,
-                        help="指定关键词组号(1-3)，如 --group 1 或 --group 1 2。"
+                        help="指定关键词组号(1-5)，如 --group 1 或 --group 4 5。"
                              "不指定则爬全部内置关键词")
+    parser.add_argument("--expand-references", action="store_true",
+                        help="从已采文献的引用列表扩展采集（引文追踪，OpenAlex）。"
+                             "需配合 --run-id 指定来源 run，新增文献写回该 run")
+    parser.add_argument("--expand-limit", type=int, default=None,
+                        help="引文扩展最多查询的引用 W ID 数（默认全部）。"
+                             "已采文献引用常达几十万条，建议设 500-2000 控制额度")
     args = parser.parse_args()
 
     collector = AcademicCollector(
@@ -953,6 +1088,30 @@ def main():
         run_id=args.run_id, resume_run=args.resume_run,
         max_pages=args.max_pages, min_relevance=args.min_relevance,
     )
+
+    # ---- 引文扩展：从已采文献的引用关系扩展采集 ----
+    if args.expand_references:
+        if not args.run_id:
+            # 未指定来源 → 自动用最新 run
+            academic_dir = Path("data/processed/academic")
+            run_dirs = sorted(
+                [d.name for d in academic_dir.iterdir() if d.is_dir()],
+                reverse=True,
+            )
+            if not run_dirs:
+                raise SystemExit("未找到任何 run，请先采集元数据")
+            args.run_id = run_dirs[0]
+            collector = AcademicCollector(
+                source=args.source, mailto=args.mailto, api_key=args.api_key,
+                run_id=args.run_id, max_pages=args.max_pages,
+                min_relevance=args.min_relevance,
+            )
+        works = collector.load_run()
+        logger.info(f"📂 引文扩展来源: run {collector.run_id} ({len(works)} 篇)")
+        expanded = collector.expand_from_references(works, args.expand_limit)
+        if expanded:
+            collector.save(expanded)  # 合并写回该 run
+        return
 
     # ---- 复用已有 run：只下载全文 ----
     if args.run_id:

@@ -74,6 +74,9 @@ python collect_english.py --group 1 --min-relevance 100 --fulltext grobid-xml
 
 # ④ 对已有 run 补下载全文（不重新采集）
 python collect_english.py --run-id <RUN_ID> --fulltext grobid-xml
+
+# ⑤ 引文扩展（从已采文献的引用关系继续挖相关文献，需 OpenAlex 源）
+python collect_english.py --run-id <OPENALEX_RUN_ID> --expand-references --expand-limit 2000
 ```
 
 ## 环境准备
@@ -307,16 +310,43 @@ python collect_english.py --source openalex --fulltext grobid-xml
 python collect_english.py --run-id 20260826_190330 --fulltext grobid-xml
 ```
 
-### `--resume-run` 指定续爬基准
+### `--resume-run` 续爬写回原 run 文件夹
 
-采集模式下，**只跳过指定 run 已采集的文献**（区别于默认扫描全部历史 run），适合从某一天/某个专题继续定向增量采集：
+**跳过指定 run 已采集的文献 + 新增数据直接合并写回该 run**（不再新开文件夹），适合分天补充同一批数据：
 
 ```bash
-# 从 run 20260827_130902 继续采集，仅跳过该 run 的文献
-python collect_english.py --resume-run 20260827_130902
+# 基于 run X 继续采集：跳过 X 已有的 + 新增写回 X（合并去重）
+python collect_english.py --source crossref --resume-run <OPENALEX_RUN_ID> --max-pages 10
 ```
 
-不指定时默认扫描全部历史 run 去重。
+- 去重基准：只跳过指定 run 已采的文献（区别于默认扫描全部历史）
+- **写回**：新采集的文献合并进该 run 的 works.json/works.csv，不覆盖原有数据
+- 验证：日志显示 `🔗 合并原 run N 条 + 新增 M 条 = 累计 N+M 条`
+
+不指定时默认扫描全部历史 run 去重，且写回**新** run 文件夹。
+
+### `--expand-references` 引文扩展采集
+
+觉得关键词检索采集太少时，从已采文献的**引用关系**里继续挖相关文献（引文追踪）：
+
+```bash
+# 从指定 run 的引用中扩展采集，新增写回该 run
+python collect_english.py --run-id <OPENALEX_RUN_ID> --expand-references
+
+# 限制扩展规模（已采文献引用常达几十万条，建议设上限控制额度）
+python collect_english.py --run-id <OPENALEX_RUN_ID> --expand-references --expand-limit 2000
+```
+
+**原理**：
+1. 收集该 run 所有文献的 `references`（OpenAlex W ID，即"这些文献引用了谁"）
+2. 批量查询这些引用文献（`filter=ids.openalex:W1|W2|...`，每批 50 个）
+3. 相关性过滤（标题须含扶贫关键词，通用词需含 China）+ 跨 run 去重
+4. 新增文献合并写回原 run
+
+**注意**：
+- 仅 OpenAlex 源可用（Crossref 的引用是 DOI，无法按 W ID 扩展）
+- 引用里的文献主题发散（含方法论/理论引用），过滤后会保留约 20-30% 相关文献
+- **务必设 `--expand-limit`**：4582 篇文献的引用高达 16.8 万 W ID，全量扩展要几千次请求会耗尽额度。建议 500-5000
 
 ## 查重机制
 
