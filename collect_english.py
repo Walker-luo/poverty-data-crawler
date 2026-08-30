@@ -212,6 +212,13 @@ class OpenAlexSource:
         "sustainable_development_goals", "open_access",
         "referenced_works_count", "relevance_score",
     ])
+    # 引文扩展用精简字段：去掉 abstract/references 等大字段（避免 504 超时）
+    EXPAND_SELECT_FIELDS = ",".join([
+        "id", "doi", "title", "display_name", "publication_year",
+        "publication_date", "type", "language", "cited_by_count",
+        "authorships", "institutions", "concepts", "keywords",
+        "open_access", "best_oa_location", "relevance_score",
+    ])
 
     def __init__(self, session: requests.Session, mailto: str, delay: float,
                  api_key: str = ""):
@@ -291,31 +298,44 @@ class OpenAlexSource:
         # 带 API key 可提升额度（免费 $0.1/天 → 带 key $1/天，约10倍）
         if self.api_key:
             params["api-key"] = self.api_key
-        resp = self.session.get(self.BASE_URL, params=params, timeout=30)
-        if resp.status_code == 429:
-            # 区分：额度用完 vs 普通限流
-            if "Insufficient budget" in resp.text or "budget" in resp.text:
-                raise BudgetExhausted()
-            logger.warning(f"OpenAlex 限流(429)，等待 10s...")
-            time.sleep(10)
-            return None
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            resp = self.session.get(self.BASE_URL, params=params, timeout=30)
+            if resp.status_code == 429:
+                # 区分：额度用完 vs 普通限流
+                if "Insufficient budget" in resp.text or "budget" in resp.text:
+                    raise BudgetExhausted()
+                logger.warning(f"OpenAlex 限流(429)，等待 10s...")
+                time.sleep(10)
+                return None
+            if resp.status_code in (502, 503, 504):
+                # 服务器繁忙/网关超时 → 退避重试
+                if attempt < 2:
+                    wait = 5 * (attempt + 1)
+                    logger.warning(
+                        f"OpenAlex {resp.status_code} 服务器繁忙，"
+                        f"重试 {attempt+1}/3 (等待 {wait}s)"
+                    )
+                    time.sleep(wait)
+                    continue
+            resp.raise_for_status()
+            return resp.json()
+        return None
 
     def get_by_ids(self, ids: List[str]) -> List[Dict]:
         """按 OpenAlex W ID 批量查询文献（引文扩展用）
 
         filter=ids.openalex:W1|W2|... 一次查多个 ID，分批避免 URL 过长。
+        用精简字段 + 小批（20），避免大响应导致 504 超时。
         """
         results = []
-        BATCH = 50
+        BATCH = 20
         for i in range(0, len(ids), BATCH):
             batch = ids[i:i + BATCH]
             params = {
                 "filter": "ids.openalex:" + "|".join(batch),
-                "per-page": PER_PAGE,
+                "per-page": len(batch),
                 "mailto": self.mailto,
-                "select": self.SELECT_FIELDS,
+                "select": self.EXPAND_SELECT_FIELDS,
             }
             data = self._request(params)
             if data:
@@ -750,12 +770,13 @@ class AcademicCollector:
         """从已采文献的引用列表扩展采集（引文追踪）
 
         收集所有 references 的 OpenAlex W ID → 批量查询 → 相关性过滤 → 去重。
-        用于关键词检索后，把已采文献引用链上的相关文献也拉进来。
+        已处理的引用记录在 run 目录 `expanded_refs.json`，分多天调用时
+        自动跳过已处理部分，从剩余引用继续（额度分摊到每天，累积覆盖更多）。
 
         Args:
-            expand_limit: 最多扩展的引用 W ID 数（默认全部）。
-                已采文献引用常达几十万条，全量扩展会耗尽额度且大量无关，
-                建议设置上限（如 500-2000），只扩展一部分高质量引用。
+            expand_limit: 本次最多处理的引用 W ID 数（默认全部剩余）。
+                每批 20 个 = 1 次请求，建议按当日额度设置
+                （如 expand_limit 15000 ≈ 750 次请求 ≈ $0.75）。
 
         Returns:
             扩展采集到的新文献列表
@@ -774,18 +795,36 @@ class AcademicCollector:
         if not ref_ids:
             logger.warning("已采文献没有可用的引用关系（W ID）")
             return []
-        # 限制扩展规模
-        total_refs = len(ref_ids)
-        if expand_limit and len(ref_ids) > expand_limit:
-            ref_ids = set(sorted(ref_ids)[:expand_limit])
-        logger.info(f"📎 已采文献引用 {total_refs} 个 W ID"
-                    f"（扩展上限 {expand_limit or '全部'}），开始引文扩展...")
 
-        # 2. 批量查询
-        raw_results = openalex_src.get_by_ids(sorted(ref_ids))
+        # 2. 加载已处理进度，计算本次剩余
+        progress_file = self.out_dir / "expanded_refs.json"
+        processed = set()
+        if progress_file.exists():
+            try:
+                processed = set(json.loads(
+                    progress_file.read_text(encoding="utf-8")))
+            except Exception:
+                processed = set()
+        remaining = sorted(ref_ids - processed)
+        total_refs = len(ref_ids)
+        if not remaining:
+            logger.info(f"✅ 所有引用({total_refs})均已扩展过，无需继续")
+            return []
+
+        if expand_limit:
+            selected = remaining[:expand_limit]
+        else:
+            selected = remaining
+        logger.info(
+            f"📎 引用共 {total_refs}，已处理 {len(processed)}，"
+            f"本次扩展 {len(selected)}（{len(selected)//20} 批请求）..."
+        )
+
+        # 3. 批量查询
+        raw_results = openalex_src.get_by_ids(selected)
         logger.info(f"   OpenAlex 命中 {len(raw_results)} 篇引用文献")
 
-        # 3. 相关性过滤 + 去重
+        # 4. 相关性过滤 + 去重
         seen_ids = self._load_seen_keys()
         expanded = []
         for w in raw_results:
@@ -809,7 +848,16 @@ class AcademicCollector:
                 seen_ids.add(key)
             expanded.append(openalex_src.normalize(w))
 
-        logger.info(f"📎 引文扩展完成: 新增 {len(expanded)} 篇相关文献")
+        # 5. 记录本次处理的引用（含被过滤的），下次从剩余继续
+        processed.update(selected)
+        progress_file.write_text(
+            json.dumps(sorted(processed), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info(
+            f"📎 引文扩展完成: 新增 {len(expanded)} 篇相关文献 | "
+            f"📌 进度 {len(processed)}/{total_refs}（剩余 {total_refs-len(processed)}）"
+        )
         return expanded
 
     def save(self, works: List[Dict]) -> None:

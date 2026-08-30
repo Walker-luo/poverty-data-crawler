@@ -346,7 +346,8 @@ python collect_english.py --run-id <OPENALEX_RUN_ID> --expand-references --expan
 **注意**：
 - 仅 OpenAlex 源可用（Crossref 的引用是 DOI，无法按 W ID 扩展）
 - 引用里的文献主题发散（含方法论/理论引用），过滤后会保留约 20-30% 相关文献
-- **务必设 `--expand-limit`**：4582 篇文献的引用高达 16.8 万 W ID，全量扩展要几千次请求会耗尽额度。建议 500-5000
+- 批量查询用**精简字段**（不含摘要/引用，避免 504 超时），扩展文献的 `abstract`/`references` 为空，需要时可用 `--fulltext` 或按 DOI 重采补充
+- **务必设 `--expand-limit`**：每批 20 个引用 ID，`--expand-limit N` ≈ N/20 次请求。4582 篇文献引用高达 16.8 万 W ID，全量会耗尽额度。建议 1000-3000（约 50-150 次请求，$0.05-0.15）
 
 ## 查重机制
 
