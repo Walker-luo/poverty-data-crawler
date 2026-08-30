@@ -294,31 +294,67 @@ class OpenAlexSource:
         return results if max_pages is None else results[:min(
             len(results), max_pages * PER_PAGE)]
 
-    def _request(self, params: Dict) -> Optional[Dict]:
-        # 带 API key 可提升额度（免费 $0.1/天 → 带 key $1/天，约10倍）
+    def _request(self, params: Dict, retries: int = 5) -> Optional[Dict]:
+        """带重试的 OpenAlex 请求
+
+        处理各类失败：
+          - 429 限流 → 区分额度用完(BudgetExhausted) 与普通限流
+          - 502/503/504 服务器繁忙 → 退避重试
+          - SSL/连接/超时 等网络异常 → 指数退避重试 + 重建连接（防坏连接复用）
+          - 其他 4xx HTTP 错误 → 优雅返回 None（不重试，永久错误）
+        """
         if self.api_key:
             params["api-key"] = self.api_key
-        for attempt in range(3):
-            resp = self.session.get(self.BASE_URL, params=params, timeout=30)
-            if resp.status_code == 429:
-                # 区分：额度用完 vs 普通限流
-                if "Insufficient budget" in resp.text or "budget" in resp.text:
-                    raise BudgetExhausted()
-                logger.warning(f"OpenAlex 限流(429)，等待 10s...")
-                time.sleep(10)
+        for attempt in range(retries):
+            try:
+                resp = self.session.get(
+                    self.BASE_URL, params=params, timeout=30)
+                if resp.status_code == 429:
+                    # 区分：额度用完 vs 普通限流
+                    if ("Insufficient budget" in resp.text
+                            or "budget" in resp.text):
+                        raise BudgetExhausted()
+                    logger.warning(f"OpenAlex 限流(429)，等待 10s...")
+                    time.sleep(10)
+                    return None
+                if resp.status_code in (502, 503, 504):
+                    # 服务器繁忙/网关超时 → 退避重试
+                    if attempt < retries - 1:
+                        wait = 5 * (attempt + 1)
+                        logger.warning(
+                            f"OpenAlex {resp.status_code} 服务器繁忙，"
+                            f"重试 {attempt+1}/{retries} (等待 {wait}s)"
+                        )
+                        time.sleep(wait)
+                        continue
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as e:
+                # 4xx/5xx（已被 raise_for_status 抛出）→ 永久错误不重试
+                status = e.response.status_code if e.response else "?"
+                logger.error(f"OpenAlex HTTP {status} 错误，放弃该批")
                 return None
-            if resp.status_code in (502, 503, 504):
-                # 服务器繁忙/网关超时 → 退避重试
-                if attempt < 2:
-                    wait = 5 * (attempt + 1)
+            except requests.RequestException as e:
+                # SSL/连接/超时 等网络异常 → 指数退避 + 重建连接（防坏连接复用）
+                if attempt < retries - 1:
+                    wait = 3 * (2 ** attempt)  # 3, 6, 12, 24...
                     logger.warning(
-                        f"OpenAlex {resp.status_code} 服务器繁忙，"
-                        f"重试 {attempt+1}/3 (等待 {wait}s)"
+                        f"OpenAlex 连接异常 {type(e).__name__}，"
+                        f"重试 {attempt+1}/{retries} (等待 {wait}s)"
                     )
+                    # 重建 session：SSLError 后连接池可能有坏连接
+                    self.session.close()
+                    self.session = requests.Session()
+                    self.session.headers["User-Agent"] = (
+                        f"poverty-research/1.0 (mailto:{self.mailto})")
+                    self.session.headers["Accept"] = "application/json"
                     time.sleep(wait)
-                    continue
-            resp.raise_for_status()
-            return resp.json()
+                else:
+                    logger.error(
+                        f"OpenAlex 请求失败（{retries}次重试）: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    return None
         return None
 
     def get_by_ids(self, ids: List[str]) -> List[Dict]:
@@ -496,18 +532,41 @@ class CrossrefSource:
             results = results[:max_pages * 200]
         return results[:limit] if limit else results
 
-    def _request(self, params: Dict) -> Optional[Dict]:
-        resp = self.session.get(self.BASE_URL, params=params, timeout=30)
-        if resp.status_code == 429:
-            logger.warning(f"Crossref 限流(429)，等待 10s...")
-            time.sleep(10)
-            return None
-        # 400 通常是 offset 触顶，返回 None 让上层停止（配合 offset 上限保护）
-        if resp.status_code in (400, 404):
-            logger.warning(f"Crossref 请求失败(HTTP {resp.status_code})，停止翻页")
-            return None
-        resp.raise_for_status()
-        return resp.json()
+    def _request(self, params: Dict, retries: int = 5) -> Optional[Dict]:
+        for attempt in range(retries):
+            try:
+                resp = self.session.get(
+                    self.BASE_URL, params=params, timeout=30)
+                if resp.status_code == 429:
+                    logger.warning(f"Crossref 限流(429)，等待 10s...")
+                    time.sleep(10)
+                    return None
+                # 400 通常是 offset 触顶，返回 None 让上层停止（配合 offset 上限保护）
+                if resp.status_code in (400, 404):
+                    logger.warning(
+                        f"Crossref 请求失败(HTTP {resp.status_code})，停止翻页")
+                    return None
+                resp.raise_for_status()
+                return resp.json()
+            except requests.RequestException as e:
+                # SSL/连接/超时 等网络异常 → 退避重试
+                if attempt < retries - 1:
+                    wait = 3 * (2 ** attempt)
+                    logger.warning(
+                        f"Crossref 连接异常 {type(e).__name__}，"
+                        f"重试 {attempt+1}/{retries} (等待 {wait}s)"
+                    )
+                    self.session.close()
+                    self.session = requests.Session()
+                    self.session.headers["User-Agent"] = (
+                        f"poverty-research/1.0 (mailto:{self.mailto})")
+                    time.sleep(wait)
+                else:
+                    logger.error(
+                        f"Crossref 请求失败（{retries}次重试）: "
+                        f"{type(e).__name__}: {e}")
+                    return None
+        return None
 
     def normalize(self, item: Dict) -> Dict:
         # 日期
