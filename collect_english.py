@@ -326,10 +326,13 @@ class OpenAlexSource:
 
         filter=ids.openalex:W1|W2|... 一次查多个 ID，分批避免 URL 过长。
         用精简字段 + 小批（20），避免大响应导致 504 超时。
+        每 50 批输出一次进度，便于长任务观察。
         """
         results = []
         BATCH = 20
-        for i in range(0, len(ids), BATCH):
+        total = len(ids)
+        total_batches = (total + BATCH - 1) // BATCH
+        for bi, i in enumerate(range(0, total, BATCH), 1):
             batch = ids[i:i + BATCH]
             params = {
                 "filter": "ids.openalex:" + "|".join(batch),
@@ -340,6 +343,13 @@ class OpenAlexSource:
             data = self._request(params)
             if data:
                 results.extend(data.get("results", []))
+            # 进度：每 50 批或最后一批
+            if bi % 50 == 0 or bi == total_batches:
+                done = min(bi * BATCH, total)
+                logger.info(
+                    f"   ⏳ 扩展进度: {done}/{total} 引用 "
+                    f"({bi}/{total_batches} 批) | 命中 {len(results)} 篇"
+                )
             time.sleep(self.delay)
         return results
 
@@ -766,10 +776,13 @@ class AcademicCollector:
         return all_works
 
     def expand_from_references(self, works: List[Dict],
-                               expand_limit: Optional[int] = None) -> List[Dict]:
+                               expand_limit: Optional[int] = None,
+                               save_every: int = 5000) -> int:
         """从已采文献的引用列表扩展采集（引文追踪）
 
-        收集所有 references 的 OpenAlex W ID → 批量查询 → 相关性过滤 → 去重。
+        收集所有 references 的 OpenAlex W ID → 分批查询 → 相关性过滤 → 去重。
+        每处理 save_every 个引用就落盘一次（合并写回 works.json），
+        避免大任务（数万引用）全量驻留内存、中途中断丢失成果。
         已处理的引用记录在 run 目录 `expanded_refs.json`，分多天调用时
         自动跳过已处理部分，从剩余引用继续（额度分摊到每天，累积覆盖更多）。
 
@@ -777,9 +790,11 @@ class AcademicCollector:
             expand_limit: 本次最多处理的引用 W ID 数（默认全部剩余）。
                 每批 20 个 = 1 次请求，建议按当日额度设置
                 （如 expand_limit 15000 ≈ 750 次请求 ≈ $0.75）。
+            save_every: 每处理多少引用落盘一次（默认 5000），
+                大任务建议 5000-10000，内存/中断更稳。
 
         Returns:
-            扩展采集到的新文献列表
+            本次新增文献总数
         """
         openalex_src = next(
             (s for s in self.sources if s.name == "openalex"), None)
@@ -794,7 +809,7 @@ class AcademicCollector:
                     ref_ids.add(rid)
         if not ref_ids:
             logger.warning("已采文献没有可用的引用关系（W ID）")
-            return []
+            return 0
 
         # 2. 加载已处理进度，计算本次剩余
         progress_file = self.out_dir / "expanded_refs.json"
@@ -809,56 +824,72 @@ class AcademicCollector:
         total_refs = len(ref_ids)
         if not remaining:
             logger.info(f"✅ 所有引用({total_refs})均已扩展过，无需继续")
-            return []
+            return 0
 
-        if expand_limit:
-            selected = remaining[:expand_limit]
-        else:
-            selected = remaining
+        selected = remaining[:expand_limit] if expand_limit else remaining
         logger.info(
             f"📎 引用共 {total_refs}，已处理 {len(processed)}，"
             f"本次扩展 {len(selected)}（{len(selected)//20} 批请求）..."
         )
 
-        # 3. 批量查询
-        raw_results = openalex_src.get_by_ids(selected)
-        logger.info(f"   OpenAlex 命中 {len(raw_results)} 篇引用文献")
-
-        # 4. 相关性过滤 + 去重
+        # 3. 分批处理 + 分批落盘
+        chunk_size = save_every if save_every and save_every > 0 else len(selected)
         seen_ids = self._load_seen_keys()
-        expanded = []
-        for w in raw_results:
-            title = (w.get("title") or w.get("display_name") or "").strip()
-            if not title:
-                continue
-            # 标题须含任一内置关键词的主题词（证明主题相关）
-            if not any(is_relevant(title, kw) for kw in ENGLISH_KEYWORDS):
-                continue
-            # 只命中通用主题词（如单纯 poverty）时，需标题含 China 才放行
-            t = title.lower()
-            if "china" not in t and "chinese" not in t:
-                hit_china_kw = any(
-                    is_relevant(title, kw) for kw in CHINA_SPECIFIC)
-                if not hit_china_kw:
-                    continue
-            key = self._dedup_key(w)
-            if key and key in seen_ids:
-                continue
-            if key:
-                seen_ids.add(key)
-            expanded.append(openalex_src.normalize(w))
+        total_new = 0
 
-        # 5. 记录本次处理的引用（含被过滤的），下次从剩余继续
-        processed.update(selected)
-        progress_file.write_text(
-            json.dumps(sorted(processed), ensure_ascii=False),
-            encoding="utf-8",
-        )
+        for chunk_start in range(0, len(selected), chunk_size):
+            chunk = selected[chunk_start:chunk_start + chunk_size]
+            raw_results = openalex_src.get_by_ids(chunk)
+            logger.info(f"   → 本批命中 {len(raw_results)} 篇引用文献")
+
+            # 相关性过滤 + 去重
+            expanded = []
+            for w in raw_results:
+                title = (w.get("title") or w.get("display_name") or "").strip()
+                if not title:
+                    continue
+                # 标题须含任一内置关键词的主题词（证明主题相关）
+                if not any(is_relevant(title, kw) for kw in ENGLISH_KEYWORDS):
+                    continue
+                # 只命中通用主题词（如单纯 poverty）时，需标题含 China 才放行
+                t = title.lower()
+                if "china" not in t and "chinese" not in t:
+                    hit_china_kw = any(
+                        is_relevant(title, kw) for kw in CHINA_SPECIFIC)
+                    if not hit_china_kw:
+                        continue
+                key = self._dedup_key(w)
+                if key and key in seen_ids:
+                    continue
+                if key:
+                    seen_ids.add(key)
+                expanded.append(openalex_src.normalize(w))
+
+            # 更新进度（含被过滤的引用）
+            processed.update(chunk)
+            progress_file.write_text(
+                json.dumps(sorted(processed), ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            # 分批落盘
+            if expanded:
+                self.save(expanded)
+                total_new += len(expanded)
+                logger.info(
+                    f"   💾 已落盘 {len(expanded)} 篇 | "
+                    f"进度 {len(processed)}/{total_refs} | 累计新增 {total_new}"
+                )
+            else:
+                logger.info(
+                    f"   (本批无相关文献) 进度 {len(processed)}/{total_refs}"
+                )
+
         logger.info(
-            f"📎 引文扩展完成: 新增 {len(expanded)} 篇相关文献 | "
+            f"📎 引文扩展完成: 新增 {total_new} 篇相关文献 | "
             f"📌 进度 {len(processed)}/{total_refs}（剩余 {total_refs-len(processed)}）"
         )
-        return expanded
+        return total_new
 
     def save(self, works: List[Dict]) -> None:
         json_path = self.out_dir / "works.json"
@@ -974,12 +1005,13 @@ class AcademicCollector:
                           fmt: str = "grobid-xml") -> int:
         """下载开放获取文献的全文
 
-        优先 content API（需 key）。content API 无索引时，
-        pdf 模式会尝试从 oa_url（best_oa_location.pdf_url）直接下载兜底。
+        优先 content API（需 key）。pdf 模式 content API 无索引时，
+        尝试从 oa_url（best_oa_location.pdf_url）直接下载兜底。
+        下载状态记录到 fulltext/download_log.json，支持断点续传与追溯。
 
         Args:
             works: 采集到的文献列表（含 source_api / id / is_oa / oa_url）
-            fmt: "grobid-xml"(结构化全文,适合主题建模) 或 "pdf"(原始文件)
+            fmt: "pdf"(优先,通用) | "grobid-xml"(结构化全文) | "both"(两者都下,pdf 优先)
 
         Returns:
             下载成功（含断点续传跳过）的篇数
@@ -1002,71 +1034,92 @@ class AcademicCollector:
             logger.info("无可下载全文的 OA 文献（OpenAlex 源）")
             return 0
 
-        ext = "xml" if fmt == "grobid-xml" else "pdf"
+        formats = ["pdf", "grobid-xml"] if fmt == "both" else [fmt]
         fulltext_dir = self.out_dir / "fulltext"
         fulltext_dir.mkdir(parents=True, exist_ok=True)
 
+        # 下载记录（断点续传 + 可追溯）
+        log_path = fulltext_dir / "download_log.json"
+        log = {}
+        if log_path.exists():
+            try:
+                log = json.loads(log_path.read_text(encoding="utf-8"))
+            except Exception:
+                log = {}
+
         logger.info(
-            f"📥 开始下载全文: {len(oa_works)} 篇 OA 文献 (格式 {fmt})"
+            f"📥 开始下载全文: {len(oa_works)} 篇 OA 文献 "
+            f"(格式 {formats})"
         )
         downloaded = fail = not_found = 0
 
         for i, w in enumerate(oa_works, 1):
             oa_id = w["id"]
-            out_path = fulltext_dir / f"{oa_id}.{ext}"
+            entry = log.setdefault(oa_id, {})
+            for f in formats:
+                ext = "xml" if f == "grobid-xml" else "pdf"
+                out_path = fulltext_dir / f"{oa_id}.{ext}"
 
-            # 断点续传
-            if out_path.exists() and out_path.stat().st_size > 0:
-                downloaded += 1
-                continue
-
-            # 1. content API 优先
-            ok = status = None
-            url = f"{CONTENT_BASE_URL}/{oa_id}.{fmt}?api_key={self.api_key}"
-            try:
-                resp = self.session.get(url, timeout=60)
-                status = resp.status_code
-                if status == 200 and len(resp.content) > 100:
-                    # content API 的 XML 是 gzip 压缩的，自动解压
-                    content = resp.content
-                    if content[:2] == b"\x1f\x8b":
-                        try:
-                            content = gzip.decompress(content)
-                        except OSError:
-                            pass  # 解压失败保留原始内容
-                    out_path.write_bytes(content)
+                # 断点续传：记录成功 或 文件已存在
+                if entry.get(f) == "ok" or (
+                        out_path.exists() and out_path.stat().st_size > 0):
+                    if entry.get(f) != "ok":
+                        entry[f] = "ok"
                     downloaded += 1
-                    ok = True
-                elif status == 404:
-                    not_found += 1  # content API 无此全文索引（正常现象）
-                    ok = False
+                    continue
+
+                # content API 下载
+                status = self._download_content_api(oa_id, f, out_path)
+                if status == "ok":
+                    entry[f] = "ok"
+                    downloaded += 1
+                elif status == "not_found":
+                    # pdf + content API 无索引 → oa_url 兜底
+                    if (f == "pdf" and w.get("oa_url")
+                            and self._download_oa_url(w["oa_url"], out_path)):
+                        entry[f] = "ok"
+                        downloaded += 1
+                    else:
+                        entry[f] = "not_found"
+                        not_found += 1
                 else:
+                    entry[f] = "fail"
                     fail += 1
-                    ok = False
-            except requests.RequestException as e:
-                logger.warning(f"  {oa_id}: content API 异常 {type(e).__name__}")
-                fail += 1
-                ok = False
-
-            # 2. content API 无结果 → 从 oa_url 直接下载 PDF 兜底
-            if not ok and status == 404 and w.get("oa_url"):
-                logger.debug(f"  {oa_id}: content API 无索引，尝试 oa_url 兜底")
-                pdf_path = fulltext_dir / f"{oa_id}.pdf"
-                if (pdf_path.exists() and pdf_path.stat().st_size > 0) \
-                        or self._download_oa_url(w["oa_url"], pdf_path):
-                    downloaded += 1
-                    not_found = max(0, not_found - 1)
 
             if i % 20 == 0 or i == len(oa_works):
                 logger.info(f"  全文进度: {i}/{len(oa_works)} | "
                             f"✓{downloaded} ✗{fail} (无索引 {not_found})")
-
             time.sleep(self.delay)
 
+        # 保存下载记录
+        log_path.write_text(
+            json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
         logger.info(f"✅ 全文下载完成: {downloaded} 篇 | 失败 {fail} 篇 | "
                     f"无索引跳过 {not_found} 篇")
-        logger.info(f"   目录: {fulltext_dir}")
+        logger.info(f"   📋 下载记录: {log_path}")
         return downloaded
+
+    def _download_content_api(self, oa_id: str, fmt: str,
+                              out_path: Path) -> str:
+        """从 content API 下载单个格式，返回 ok / not_found / fail"""
+        url = f"{CONTENT_BASE_URL}/{oa_id}.{fmt}?api_key={self.api_key}"
+        try:
+            resp = self.session.get(url, timeout=60)
+            if resp.status_code == 200 and len(resp.content) > 100:
+                content = resp.content
+                # content API 的 XML 是 gzip 压缩的，自动解压
+                if content[:2] == b"\x1f\x8b":
+                    try:
+                        content = gzip.decompress(content)
+                    except OSError:
+                        pass
+                out_path.write_bytes(content)
+                return "ok"
+            elif resp.status_code == 404:
+                return "not_found"
+            return "fail"
+        except requests.RequestException:
+            return "fail"
 
     @staticmethod
     def _download_oa_url(oa_url: str, out_path: Path) -> bool:
@@ -1113,9 +1166,10 @@ def main():
     parser.add_argument("--mailto", default=MAILTO)
     parser.add_argument("--api-key", default="",
                         help="OpenAlex API key（全文下载用，免费注册 openalex.org/users）")
-    parser.add_argument("--fulltext", choices=["grobid-xml", "pdf", "none"],
+    parser.add_argument("--fulltext", choices=["grobid-xml", "pdf", "both", "none"],
                         default="none",
-                        help="采集后下载全文: grobid-xml(结构化,主题建模推荐) | pdf | none")
+                        help="采集后下载全文: pdf(优先,通用) | grobid-xml(结构化,主题建模) "
+                             "| both(两者都下,pdf优先) | none")
     parser.add_argument("--run-id", type=str, default=None,
                         help="复用已有 run 的数据（读取其 works.json 下载全文，不重新采集）")
     parser.add_argument("--resume-run", type=str, default=None,
@@ -1129,6 +1183,9 @@ def main():
     parser.add_argument("--expand-limit", type=int, default=None,
                         help="引文扩展最多查询的引用 W ID 数（默认全部）。"
                              "已采文献引用常达几十万条，建议设 500-2000 控制额度")
+    parser.add_argument("--expand-save-every", type=int, default=5000,
+                        help="引文扩展每处理多少引用落盘一次（默认 5000）。"
+                             "大任务（数万引用）建议保持 5000-10000，防内存峰值/中断丢失")
     args = parser.parse_args()
 
     collector = AcademicCollector(
@@ -1156,9 +1213,13 @@ def main():
             )
         works = collector.load_run()
         logger.info(f"📂 引文扩展来源: run {collector.run_id} ({len(works)} 篇)")
-        expanded = collector.expand_from_references(works, args.expand_limit)
-        if expanded:
-            collector.save(expanded)  # 合并写回该 run
+        # 内部分批处理 + 分批落盘（每 save_every 引用保存一次）
+        new_count = collector.expand_from_references(
+            works, args.expand_limit, args.expand_save_every)
+        if new_count:
+            logger.info(
+                f"✅ 引文扩展完成: 新增 {new_count} 篇，"
+                f"已分批保存到 run {collector.run_id}")
         return
 
     # ---- 复用已有 run：只下载全文 ----

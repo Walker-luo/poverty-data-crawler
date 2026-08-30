@@ -283,18 +283,31 @@ python collect_english.py --group 5 --min-relevance 100   # 第5天
 
 | 值 | 说明 |
 |------|------|
-| `grobid-xml` | **推荐**，结构化全文（TEI XML），主题建模语料 |
-| `pdf` | 原始 PDF 文件 |
+| `pdf` | **优先**，原始 PDF（通用，后续可任意处理） |
+| `grobid-xml` | 结构化全文（TEI XML），主题建模语料 |
+| `both` | **两者都下，pdf 优先**（先试 pdf 再补 grobid-xml） |
 | `none` | 默认，只爬元数据 |
 
 ```bash
 # 采集 + 下载全文（需 API key）
-python collect_english.py --source openalex --fulltext grobid-xml
+python collect_english.py --source openalex --fulltext both
 ```
 
 **全文获取两路**：
-1. **content API**（需 key）：`content.openalex.org/works/{id}.grobid-xml`，命中率约 40-50%
-2. **oa_url 兜底**：content API 无索引时，尝试从开放获取链接直接下 PDF
+1. **content API**（需 key）：`content.openalex.org/works/{id}.{pdf|grobid-xml}`，命中率约 40-50%
+2. **oa_url 兜底**：pdf 模式 content API 无索引时，尝试从开放获取链接直接下 PDF
+
+**下载记录（`fulltext/download_log.json`）**：
+- 自动记录每篇每个格式的下载状态（`ok` / `not_found` / `fail`），可追溯哪些下载成功、哪些无索引
+- **断点续传**：已记录 `ok` 的文件不再重复下载（省 $0.01/篇）
+- 中途中断后重跑，自动跳过已完成部分
+
+```json
+{
+  "W2915791602": {"pdf": "ok", "grobid-xml": "not_found"},
+  "W3203553739": {"pdf": "not_found", "grobid-xml": "ok"}
+}
+```
 
 **下载细节**：
 - grobid XML 以 gzip 压缩传输，脚本自动解压为纯文本
@@ -339,15 +352,22 @@ python collect_english.py --run-id <OPENALEX_RUN_ID> --expand-references --expan
 
 **原理**：
 1. 收集该 run 所有文献的 `references`（OpenAlex W ID，即"这些文献引用了谁"）
-2. 批量查询这些引用文献（`filter=ids.openalex:W1|W2|...`，每批 50 个）
+2. 批量查询这些引用文献（`filter=ids.openalex:W1|W2|...`，每批 20 个）
 3. 相关性过滤（标题须含扶贫关键词，通用词需含 China）+ 跨 run 去重
 4. 新增文献合并写回原 run
+
+**进度展示**：每处理 50 批（1000 个引用）输出一次进度：
+
+```
+⏳ 扩展进度: 2000/15000 引用 (100/750 批) | 命中 320 篇
+```
 
 **注意**：
 - 仅 OpenAlex 源可用（Crossref 的引用是 DOI，无法按 W ID 扩展）
 - 引用里的文献主题发散（含方法论/理论引用），过滤后会保留约 20-30% 相关文献
 - 批量查询用**精简字段**（不含摘要/引用，避免 504 超时），扩展文献的 `abstract`/`references` 为空，需要时可用 `--fulltext` 或按 DOI 重采补充
 - **务必设 `--expand-limit`**：每批 20 个引用 ID，`--expand-limit N` ≈ N/20 次请求。4582 篇文献引用高达 16.8 万 W ID，全量会耗尽额度。建议 1000-3000（约 50-150 次请求，$0.05-0.15）
+- **分天累积**：已处理引用记录在 `expanded_refs.json`，每天 expand 自动从剩余继续（见"分天累积"小节）
 
 ## 查重机制
 
