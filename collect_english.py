@@ -47,6 +47,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
+import urllib3
+
+# 静音 SSL 证书验证警告（下载 OA 文件用 verify=False，警告噪音大）
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -626,7 +630,8 @@ class AcademicCollector:
                  run_id: Optional[str] = None,
                  resume_run: Optional[str] = None,
                  max_pages: Optional[int] = None,
-                 min_relevance: Optional[float] = None):
+                 min_relevance: Optional[float] = None,
+                 out_dir: Optional[str] = None):
         self.mailto = mailto
         self.delay = delay
         self.api_key = api_key or OPENALEX_API_KEY
@@ -647,13 +652,24 @@ class AcademicCollector:
 
         # run_id → 复用其目录（下载全文用）
         # resume_run → 续爬并写回该 run 目录（数据累积在同一文件夹）
-        self.run_id = run_id or resume_run or datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.out_dir = Path(f"data/processed/academic/{self.run_id}")
+        # out_dir   → 显式指定输出目录（覆盖默认路径）
+        if out_dir:
+            self.out_dir = Path(out_dir)
+            self.run_id = run_id or self.out_dir.name
+        else:
+            self.run_id = run_id or resume_run or datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.out_dir = Path(f"data/processed/academic/{self.run_id}")
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
     def load_run(self) -> List[Dict]:
-        """读取已有 run 的 works.json"""
-        path = self.out_dir / "works.json"
+        """读取已有 run 的 works.json
+
+        来源优先级：自定义 out_dir（若含 works.json）> academic/{run_id}。
+        这样 --run-id X --out-dir Y 可加载 X 的数据、输出到 Y。
+        """
+        out_path = self.out_dir / "works.json"
+        path = out_path if out_path.exists() else Path(
+            f"data/processed/academic/{self.run_id}/works.json")
         if not path.exists():
             raise SystemExit(f"未找到已采集数据: {path}")
         with open(path, encoding="utf-8") as f:
@@ -1061,7 +1077,8 @@ class AcademicCollector:
     # ================================================================
 
     def download_fulltext(self, works: List[Dict],
-                          fmt: str = "grobid-xml") -> int:
+                          fmt: str = "grobid-xml",
+                          limit: Optional[int] = None) -> int:
         """下载开放获取文献的全文
 
         优先 content API（需 key）。pdf 模式 content API 无索引时，
@@ -1071,6 +1088,7 @@ class AcademicCollector:
         Args:
             works: 采集到的文献列表（含 source_api / id / is_oa / oa_url）
             fmt: "pdf"(优先,通用) | "grobid-xml"(结构化全文) | "both"(两者都下,pdf 优先)
+            limit: 只下载前 N 篇 OA 文献（小批量测试用，默认全部）
 
         Returns:
             下载成功（含断点续传跳过）的篇数
@@ -1093,7 +1111,16 @@ class AcademicCollector:
             logger.info("无可下载全文的 OA 文献（OpenAlex 源）")
             return 0
 
-        formats = ["pdf", "grobid-xml"] if fmt == "both" else [fmt]
+        # 格式策略：
+        #   both        → pdf + grobid-xml 都尽力下载（两个都想要）
+        #   pdf         → pdf 优先，pdf 无果时用 grobid-xml 兜底
+        #   grobid-xml  → xml 优先，xml 无果时用 pdf 兜底
+        if fmt == "both":
+            formats = ["pdf", "grobid-xml"]
+            fallback = None
+        else:
+            formats = [fmt]
+            fallback = "grobid-xml" if fmt == "pdf" else "pdf"
         fulltext_dir = self.out_dir / "fulltext"
         fulltext_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1106,15 +1133,46 @@ class AcademicCollector:
             except Exception:
                 log = {}
 
+        # 增量过滤：跳过已成功下载的文献（log 任一格式 ok 或文件已存在）
+        # 这样 --fulltext-limit N 每次推进到"尚未下载的"前 N 篇，2 次命令 → 2 倍下载量
+        downloaded = 0
+        pending = []
+        for w in oa_works:
+            oa_id = w["id"]
+            entry = log.get(oa_id, {})
+            already = any(entry.get(f) in ("ok", "not_found") for f in entry)
+            # not_found 也跳过：该文献已确认 content 无全文，避免每次重试占用 limit
+            if not already:
+                for f in formats:
+                    ext = "xml" if f == "grobid-xml" else "pdf"
+                    p = fulltext_dir / f"{oa_id}.{ext}"
+                    if p.exists() and p.stat().st_size > 0:
+                        already = True
+                        break
+            if already:
+                downloaded += 1  # 已下载，计入跳过
+            else:
+                pending.append(w)
+
+        oa_works = pending[:limit] if limit else pending
+        if not oa_works:
+            logger.info("✅ 增量检查: 剩余 OA 均已下载，无需继续 "
+                        f"(已跳过 {downloaded} 篇)")
+            return downloaded
+
         logger.info(
-            f"📥 开始下载全文: {len(oa_works)} 篇 OA 文献 "
-            f"(格式 {formats})"
+            f"📥 开始下载全文: {len(oa_works)} 篇待下载 "
+            f"(已跳过 {downloaded} 篇, 格式 {formats})"
         )
-        downloaded = fail = not_found = 0
+        fail = not_found = 0
+        failures: List[str] = []  # 失败明细（写 download_fail.log + 精简报错）
 
         for i, w in enumerate(oa_works, 1):
             oa_id = w["id"]
             entry = log.setdefault(oa_id, {})
+            got = False  # 本篇是否至少成功一个格式
+
+            # 1. 主格式（both 时依次两个）
             for f in formats:
                 ext = "xml" if f == "grobid-xml" else "pdf"
                 out_path = fulltext_dir / f"{oa_id}.{ext}"
@@ -1124,6 +1182,7 @@ class AcademicCollector:
                         out_path.exists() and out_path.stat().st_size > 0):
                     if entry.get(f) != "ok":
                         entry[f] = "ok"
+                    got = True
                     downloaded += 1
                     continue
 
@@ -1131,9 +1190,40 @@ class AcademicCollector:
                 status = self._download_content_api(oa_id, f, out_path)
                 if status == "ok":
                     entry[f] = "ok"
+                    got = True
                     downloaded += 1
                 elif status == "not_found":
                     # pdf + content API 无索引 → oa_url 兜底
+                    if (f == "pdf" and w.get("oa_url")
+                            and self._download_oa_url(w["oa_url"], out_path)):
+                        entry[f] = "ok"
+                        got = True
+                        downloaded += 1
+                    else:
+                        entry[f] = "not_found"
+                        not_found += 1
+                        failures.append(f"{oa_id} | 无全文")
+                else:
+                    entry[f] = "fail"
+                    fail += 1
+                    failures.append(f"{oa_id} | 下载失败")
+
+            # 2. 兜底格式：主格式没成功且非 both → 试另一格式补充
+            if fallback and not got and entry.get(fallback) not in ("ok",):
+                f = fallback
+                ext = "xml" if f == "grobid-xml" else "pdf"
+                out_path = fulltext_dir / f"{oa_id}.{ext}"
+
+                if entry.get(f) == "ok" or (
+                        out_path.exists() and out_path.stat().st_size > 0):
+                    entry[f] = "ok"
+                    downloaded += 1
+                    continue
+                status = self._download_content_api(oa_id, f, out_path)
+                if status == "ok":
+                    entry[f] = "ok"
+                    downloaded += 1
+                elif status == "not_found":
                     if (f == "pdf" and w.get("oa_url")
                             and self._download_oa_url(w["oa_url"], out_path)):
                         entry[f] = "ok"
@@ -1141,9 +1231,11 @@ class AcademicCollector:
                     else:
                         entry[f] = "not_found"
                         not_found += 1
+                        failures.append(f"{oa_id} | 无全文")
                 else:
                     entry[f] = "fail"
                     fail += 1
+                    failures.append(f"{oa_id} | 下载失败")
 
             if i % 20 == 0 or i == len(oa_works):
                 logger.info(f"  全文进度: {i}/{len(oa_works)} | "
@@ -1156,6 +1248,36 @@ class AcademicCollector:
         logger.info(f"✅ 全文下载完成: {downloaded} 篇 | 失败 {fail} 篇 | "
                     f"无索引跳过 {not_found} 篇")
         logger.info(f"   📋 下载记录: {log_path}")
+
+        # 失败明细：写 download_fail.log（追加累积）+ 终端精简报错
+        if failures:
+            fail_log = fulltext_dir / "download_fail.log"
+            # 按文献去重（一篇可能 pdf+xml 都失败），保留首个原因
+            seen_fail: Dict[str, str] = {}
+            for line in failures:
+                wid = line.split(" | ")[0]
+                if wid not in seen_fail:
+                    seen_fail[wid] = line
+            with open(fail_log, "a", encoding="utf-8") as f:
+                f.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"Download Run: {len(oa_works)} 篇 | 格式 {formats}\n")
+                for line in seen_fail.values():
+                    f.write(f"  ✗ {line}\n")
+            logger.info(f"   ❌ 失败明细: {fail_log} ({len(seen_fail)} 篇)")
+            # 终端只显示前 15 条，避免刷屏
+            for line in list(seen_fail.values())[:15]:
+                logger.info(f"     ✗ {line}")
+            if len(seen_fail) > 15:
+                logger.info(f"     ... 其余 {len(seen_fail)-15} 条见 {fail_log}")
+
+        # 全部无索引时给出友好提示（避免误判为故障）
+        if downloaded == 0 and not_found > 0:
+            logger.info(
+                "💡 提示: 这批 OA 文献在 content 索引可能无全文"
+                "（正常现象，命中率约 50%，Elsevier/部分仓库常见）。"
+                "可加大 --fulltext-limit 多测几篇，或对 --out-dir "
+                "配合完整下载观察真实成功率。"
+            )
         return downloaded
 
     def _download_content_api(self, oa_id: str, fmt: str,
@@ -1245,12 +1367,18 @@ def main():
     parser.add_argument("--expand-save-every", type=int, default=5000,
                         help="引文扩展每处理多少引用落盘一次（默认 5000）。"
                              "大任务（数万引用）建议保持 5000-10000，防内存峰值/中断丢失")
+    parser.add_argument("--out-dir", type=str, default=None,
+                        help="指定输出目录（默认 data/processed/academic/{run_id}）。"
+                             "下载全文/采集数据都写入该目录")
+    parser.add_argument("--fulltext-limit", type=int, default=None,
+                        help="下载全文时只处理前 N 篇 OA 文献（小批量测试用，默认全部）")
     args = parser.parse_args()
 
     collector = AcademicCollector(
         source=args.source, mailto=args.mailto, api_key=args.api_key,
         run_id=args.run_id, resume_run=args.resume_run,
         max_pages=args.max_pages, min_relevance=args.min_relevance,
+        out_dir=args.out_dir,
     )
 
     # ---- 引文扩展：从已采文献的引用关系扩展采集 ----
@@ -1286,7 +1414,10 @@ def main():
         works = collector.load_run()
         logger.info(f"📂 复用已有 run {args.run_id}: 加载 {len(works)} 条文献")
         if args.fulltext != "none":
-            collector.download_fulltext(works, fmt=args.fulltext)
+            limit_hint = f" (前 {args.fulltext_limit} 篇)" if args.fulltext_limit else ""
+            logger.info(f"📥 开始下载全文{limit_hint}...")
+            collector.download_fulltext(works, fmt=args.fulltext,
+                                        limit=args.fulltext_limit)
         else:
             logger.info("   提示: 加 --fulltext grobid-xml 可下载全文")
         return
@@ -1303,7 +1434,8 @@ def main():
     if works:
         collector.save(works)
         if args.fulltext != "none":
-            collector.download_fulltext(works, fmt=args.fulltext)
+            collector.download_fulltext(works, fmt=args.fulltext,
+                                        limit=args.fulltext_limit)
         logger.info(f"✅ 数据目录: {collector.out_dir}")
     else:
         logger.warning("未采集到任何文献")

@@ -293,6 +293,25 @@ python collect_english.py --group 5 --min-relevance 100   # 第5天
 python collect_english.py --source openalex --fulltext both
 ```
 
+### `--fulltext-limit` 小批量测试全文（增量推进）
+
+对已有 run 只下载前 N 篇待下载的 OA 文献。**增量逻辑**：每次自动跳过已处理过的文献（已下载 ok 或已确认无全文 not_found），从剩余的开始取 N 篇 —— 用同样的命令重复跑，每次推进一批，下载量累积：
+
+```bash
+# 第 1 次：下载前 3 篇待下载的（约 $0.03，十几秒）
+python collect_english.py --run-id 20260829_161402 --fulltext pdf --fulltext-limit 3
+
+# 第 2 次：跳过已处理的 3 篇，下载接下来的 3 篇 → 累积 6 篇
+python collect_english.py --run-id 20260829_161402 --fulltext pdf --fulltext-limit 3
+```
+
+日志确认推进：
+
+```
+第 1 次: 📥 开始下载全文: 5 篇待下载 (已跳过 0 篇)
+第 2 次: 📥 开始下载全文: 5 篇待下载 (已跳过 5 篇)   ← 推进到下一批
+```
+
 **全文获取两路**：
 1. **content API**（需 key）：`content.openalex.org/works/{id}.{pdf|grobid-xml}`，命中率约 40-50%
 2. **oa_url 兜底**：pdf 模式 content API 无索引时，尝试从开放获取链接直接下 PDF
@@ -309,10 +328,35 @@ python collect_english.py --source openalex --fulltext both
 }
 ```
 
+**失败明细（`fulltext/download_fail.log`，追加累积）**：
+- 每个下载失败的文献一行，格式 `✗ W编号 | 原因`（原因：`无全文` / `下载失败`）
+- 终端只显示前 15 条（避免刷屏），完整记录在 log 文件
+
+```
+[2026-09-01 22:23:49] Download Run: 3 篇 | 格式 ['pdf']
+  ✗ W2915791602 | 无全文
+  ✗ W3203553739 | 无全文
+```
+
 **下载细节**：
 - grobid XML 以 gzip 压缩传输，脚本自动解压为纯文本
 - content API 无索引（`404 Work not found`）不算失败，会尝试 oa_url，无则跳过
 - 带浏览器 UA 下载，用 `%PDF` magic 校验过滤 HTML 验证页
+- SSL 证书警告已静音（`InsecureRequestWarning` 不再刷屏）
+
+### `--out-dir` 指定输出目录
+
+默认输出到 `data/processed/academic/{run_id}/`，可用 `--out-dir` 指定任意目录（采集数据 / 下载全文都写入该目录）：
+
+```bash
+# 下载全文到指定目录（配合 --run-id 加载数据、--fulltext-limit 小批量测试）
+python collect_english.py --run-id 20260829_161402 --fulltext pdf --fulltext-limit 3 --out-dir /path/to/export
+
+# 采集数据到指定目录
+python collect_english.py --source openalex --min-relevance 100 --out-dir /path/to/export
+```
+
+> `--run-id X --out-dir Y`：从 X 加载文献数据，下载的全文输出到 Y/fulltext/。
 
 ### `--run-id` 复用已有数据
 
