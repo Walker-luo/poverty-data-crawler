@@ -1110,6 +1110,7 @@ class AcademicCollector:
         if not oa_works:
             logger.info("无可下载全文的 OA 文献（OpenAlex 源）")
             return 0
+        total_oa = len(oa_works)  # run 里 OA 总数（统计用）
 
         # 格式策略：
         #   both        → pdf + grobid-xml 都尽力下载（两个都想要）
@@ -1133,39 +1134,45 @@ class AcademicCollector:
             except Exception:
                 log = {}
 
-        # 增量过滤：跳过已成功下载的文献（log 任一格式 ok 或文件已存在）
-        # 这样 --fulltext-limit N 每次推进到"尚未下载的"前 N 篇，2 次命令 → 2 倍下载量
-        downloaded = 0
+        # 增量过滤：跳过已处理的文献，区分"已成功" / "已无全文"
+        # --fulltext-limit N 每次推进到"尚未处理"的前 N 篇
+        downloaded = 0   # 已成功下载（历史 ok + 文件存在 + 本次成功）
+        not_found = 0    # 已确认无全文（历史 not_found + 本次）
         pending = []
         for w in oa_works:
             oa_id = w["id"]
             entry = log.get(oa_id, {})
-            already = any(entry.get(f) in ("ok", "not_found") for f in entry)
-            # not_found 也跳过：该文献已确认 content 无全文，避免每次重试占用 limit
-            if not already:
+            success = any(entry.get(f) == "ok" for f in entry)
+            if not success:
                 for f in formats:
                     ext = "xml" if f == "grobid-xml" else "pdf"
                     p = fulltext_dir / f"{oa_id}.{ext}"
                     if p.exists() and p.stat().st_size > 0:
-                        already = True
+                        success = True
                         break
-            if already:
-                downloaded += 1  # 已下载，计入跳过
-            else:
-                pending.append(w)
+            if success:
+                downloaded += 1
+                continue
+            if any(entry.get(f) == "not_found" for f in entry):
+                not_found += 1
+                continue
+            pending.append(w)
 
         oa_works = pending[:limit] if limit else pending
         if not oa_works:
-            logger.info("✅ 增量检查: 剩余 OA 均已下载，无需继续 "
-                        f"(已跳过 {downloaded} 篇)")
+            logger.info(
+                f"✅ 增量检查: 待下 OA 均已处理，无需继续"
+                f" (成功 {downloaded} | 无全文 {not_found})"
+            )
             return downloaded
 
         logger.info(
             f"📥 开始下载全文: {len(oa_works)} 篇待下载 "
-            f"(已跳过 {downloaded} 篇, 格式 {formats})"
+            f"(已成功 {downloaded} | 无全文 {not_found} | 格式 {formats})"
         )
-        fail = not_found = 0
+        fail = 0
         failures: List[str] = []  # 失败明细（写 download_fail.log + 精简报错）
+        budget_stop = False  # content API 额度用完时停止
 
         for i, w in enumerate(oa_works, 1):
             oa_id = w["id"]
@@ -1192,6 +1199,9 @@ class AcademicCollector:
                     entry[f] = "ok"
                     got = True
                     downloaded += 1
+                elif status == "budget":
+                    budget_stop = True
+                    break  # 额度用完 → 停止下载
                 elif status == "not_found":
                     # pdf + content API 无索引 → oa_url 兜底
                     if (f == "pdf" and w.get("oa_url")
@@ -1207,6 +1217,8 @@ class AcademicCollector:
                     entry[f] = "fail"
                     fail += 1
                     failures.append(f"{oa_id} | 下载失败")
+            if budget_stop:
+                break
 
             # 2. 兜底格式：主格式没成功且非 both → 试另一格式补充
             if fallback and not got and entry.get(fallback) not in ("ok",):
@@ -1223,6 +1235,9 @@ class AcademicCollector:
                 if status == "ok":
                     entry[f] = "ok"
                     downloaded += 1
+                elif status == "budget":
+                    budget_stop = True
+                    break
                 elif status == "not_found":
                     if (f == "pdf" and w.get("oa_url")
                             and self._download_oa_url(w["oa_url"], out_path)):
@@ -1241,6 +1256,9 @@ class AcademicCollector:
                 logger.info(f"  全文进度: {i}/{len(oa_works)} | "
                             f"✓{downloaded} ✗{fail} (无索引 {not_found})")
             time.sleep(self.delay)
+            if budget_stop:
+                logger.info("   ⏹️ 由于 content API 额度用完，停止本次下载")
+                break
 
         # 保存下载记录
         log_path.write_text(
@@ -1248,6 +1266,37 @@ class AcademicCollector:
         logger.info(f"✅ 全文下载完成: {downloaded} 篇 | 失败 {fail} 篇 | "
                     f"无索引跳过 {not_found} 篇")
         logger.info(f"   📋 下载记录: {log_path}")
+
+        # 完整下载统计（文献级，从 download_log 准确统计）+ 写入 summary.md
+        done_cnt = sum(1 for e in log.values() if "ok" in e.values())
+        nf_cnt = sum(1 for e in log.values()
+                     if "ok" not in e.values() and "not_found" in e.values())
+        fail_cnt = sum(1 for e in log.values()
+                       if "ok" not in e.values()
+                       and "not_found" not in e.values()
+                       and "fail" in e.values())
+        remaining = max(0, total_oa - len(log))  # 从未处理过的 OA
+        pct = done_cnt * 100 // max(1, total_oa)
+        logger.info(
+            f"📊 下载统计: 总OA {total_oa} | ✓成功 {done_cnt} ({pct}%) | "
+            f"✗失败 {fail_cnt} | 无全文 {nf_cnt} | ⏳未下载 {remaining}"
+        )
+        if budget_stop:
+            logger.info(
+                "   ⚠️ content API 额度用完中止，未下载部分下次重跑自动续爬")
+        summary_path = self.out_dir / "summary.md"
+        if summary_path.exists():
+            try:
+                with open(summary_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"\n## 全文下载统计 "
+                        f"({datetime.now().strftime('%Y-%m-%d %H:%M')})\n"
+                        f"- 成功 {done_cnt} | 失败 {fail_cnt} | "
+                        f"无全文 {nf_cnt} | 未下载 {remaining} "
+                        f"(总OA {total_oa}，进度 {pct}%)\n"
+                    )
+            except Exception:
+                pass
 
         # 失败明细：写 download_fail.log（追加累积）+ 终端精简报错
         if failures:
@@ -1282,7 +1331,10 @@ class AcademicCollector:
 
     def _download_content_api(self, oa_id: str, fmt: str,
                               out_path: Path) -> str:
-        """从 content API 下载单个格式，返回 ok / not_found / fail"""
+        """从 content API 下载单个格式
+
+        Returns: ok / not_found / budget(额度用完,应停止) / fail
+        """
         url = f"{CONTENT_BASE_URL}/{oa_id}.{fmt}?api_key={self.api_key}"
         try:
             resp = self.session.get(url, timeout=60)
@@ -1296,8 +1348,22 @@ class AcademicCollector:
                         pass
                 out_path.write_bytes(content)
                 return "ok"
-            elif resp.status_code == 404:
+            if resp.status_code == 404:
                 return "not_found"
+            if resp.status_code == 429:
+                # 额度用完 → 终止全量下载（避免每篇报"下载失败"刷屏）
+                if ("Insufficient budget" in resp.text
+                        or "budget" in resp.text):
+                    return "budget"
+                time.sleep(10)  # 普通限流退避
+                return "fail"
+            if resp.status_code in (502, 503, 504):
+                time.sleep(5)  # 服务器繁忙，重试一次
+                resp = self.session.get(url, timeout=60)
+                if resp.status_code == 200 and 100 < len(resp.content):
+                    out_path.write_bytes(resp.content)
+                    return "ok"
+                return "fail"
             return "fail"
         except requests.RequestException:
             return "fail"
