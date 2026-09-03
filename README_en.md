@@ -1,4 +1,20 @@
-# 英文学术文献采集器
+# 国外语料采集
+
+采集**国外英文**关于中国贫困治理/精准扶贫/脱贫/乡村振兴的语料，输出结构化数据供**知识图谱**和**主题建模**使用。
+
+## 语料结构（三层）
+
+| 层 | 内容 | 脚本 | 数据目录 |
+|----|------|------|---------|
+| **① 学术文献** | OpenAlex / Crossref 论文（引用/概念/机构） | [collect_english.py](collect_english.py) | `data/processed/academic/` |
+| **② 官方组织报告** | WHO/World Bank 等 DSpace 报告库（含全文） | [report_collector.py](report_collector.py) | `data/processed/report/` |
+| **③ 国际新闻** | 国际英文媒体（规划中） | - | `data/processed/env_news/` |
+
+三者统一 `source_type` 字段（`academic` / `report` / `news`），后续合并建图。
+
+---
+
+# 一、英文学术文献采集器
 
 ## 项目目标
 
@@ -527,3 +543,124 @@ Crossref 源摘要覆盖率极低（常见的 0/5），这是数据源固有特�
 
 - 429 + `Insufficient budget` → 额度用尽，等 UTC 重置或充值
 - 429 + 其他 → 请求过快，脚本已有自动退避（等待 10s 重试）
+
+---
+
+# 二、官方组织报告采集器
+
+## 项目目标
+
+采集**国际组织公开报告库**中关于中国贫困/减贫/乡村振兴的报告元数据与全文：
+
+- 🌐 多数国际组织报告库基于 **DSpace**（WHO IRIS / World Bank OKR 等），统一 REST API 可覆盖多机构
+- 📄 报告全文含 PDF（原始版式）+ **TXT**（DSpace 提取的全文文本，主题建模直接可用，无需 PDF 解析）
+- 🔍 按机构 × 英文关键词抓取标题/年份/摘要/机构元数据
+- 📊 按 handle 跨 run 增量去重
+
+## 快速开始
+
+```bash
+python report_collector.py                              # 全部机构元数据
+python report_collector.py --org WHO --download         # 指定机构 + 下载全文
+python report_collector.py --org WHO --limit 5          # 小批量测试
+```
+
+### 全量爬取流程（服务器上建库）
+
+```bash
+# ① 先探测各机构可用性（服务器网络环境不同，结果更准）
+python report_collector.py --check-orgs
+
+# ② 全量爬元数据（默认跑全部 DSpace 机构，不可达的自动跳过）
+python report_collector.py
+
+# ③ 采集后下载全文（PDF 优先，txt 兜底；--include-txt 额外下全文文本）
+python report_collector.py --download
+
+# ④ 后期补下载全文（从已有 run，不重新采集，增量续爬）
+python report_collector.py --run-id <RUN_ID> --download
+```
+
+> 首次建库建议：`--check-orgs` 确认可用机构 → 全量元数据 → 下载全文，分步执行便于监控。
+
+## 机构库（REPORT_REPOSITORIES）
+
+| 机构 | 报告库 | 状态 |
+|------|--------|------|
+| WHO | iris.who.int | ✅ 已验证（可全量） |
+| WorldBank | openknowledge.worldbank.org | ✅ 已验证（curl 确认，可全量） |
+| IFAD | repository.ifad.org | ⏳ 待服务器验证 |
+| UNWomen | docs.unwomen.org | ⏳ 待验证 |
+| UNESCAP | repository.unescap.org | ⏳ 待验证 |
+| FAO / ADB / ILO | 非 DSpace | 未适配（预留） |
+
+> 服务器上跑 `--check-orgs` 输出可用的机构清单，据此用 `--org <机构...>` 全量爬。
+
+## 命令行参数详解
+
+| 参数 | 说明 |
+|------|------|
+| `--org` | 机构名（空格分隔，默认全部 DSpace 机构） |
+| `--keywords` | 自定义英文关键词 |
+| `--limit` | 每机构每关键词限条数（测试用） |
+| `--out-dir` | 指定输出目录 |
+| `--run-id` | 复用已有 run 的报告元数据下载全文（不重新采集） |
+| `--download` | 下载全文（**PDF 优先**，txt 兜底） |
+| `--include-txt` | 已下 PDF 再额外下 txt 全文文本（主题建模语料） |
+| `--check-orgs` | 探测各机构库可用性，列出可用清单（不采集） |
+
+```bash
+# 只下载全文（从已有 run），PDF 优先
+python report_collector.py --run-id <RUN_ID> --download
+
+# PDF + TXT 都下（txt 供主题建模）
+python report_collector.py --run-id <RUN_ID> --download --include-txt
+```
+
+## 全文格式说明（重要）
+
+| 格式 | 内容 | 用途 |
+|------|------|------|
+| `.pdf` | 原始报告（保留图表/版式） | 阅读、引用 |
+| `.txt` | DSpace 提取的**全文文本**（内容与 PDF 相同） | **主题建模首选**（无需 PDF 解析） |
+
+默认 **PDF 优先**（下到的 `.pdf` 就是报告原文）；PDF 缺失时才用 txt 兜底；
+`--include-txt` 可在 PDF 之外额外下载 txt。
+
+## 增量与去重
+
+- **跨 run 去重**：按 DSpace `handle`（如 `10665/62630`）去重，重跑自动跳过已采集
+- **增量写回**：合并进原 run 的 works.json
+- **全文断点**：已下载的 PDF/TXT 不重复下载
+
+## 输出
+
+```
+data/processed/report/{run_id}/
+├── works.json      # 报告元数据
+├── works.csv
+├── summary.md
+└── fulltext/       # --download 下载的 PDF / TXT
+    ├── 10665_62630.pdf
+    └── 10665_62630.txt
+```
+
+### 字段
+
+| 字段 | 说明 |
+|------|------|
+| `title` | 报告标题 |
+| `publication_year` | 年份 |
+| `abstract` | 摘要（部分报告为空，可用 PDF/TXT 补） |
+| `authors` | 作者 |
+| `institution` | 机构名（WHO / WorldBank / ...） |
+| `handle` | DSpace 唯一标识（去重键） |
+| `url` | 报告页面链接 |
+| `source_type` | `report`（区分语料类型） |
+
+## 故障排查
+
+- **+0 条** → 该关键词下的报告 handle 已在历史 run，增量去重生效（正常）
+- **SSL 抖动**（World Bank/IFAD 个别机构）→ 换网络/代理重试；服务器上复测
+- **下载不到全文** → 偶发 WHO 限流，重跑 `--run-id X --download` 自动续（已下载跳过）
+- **`normalize` KeyError**（`dc.creator` 结构差异）→ 已修复，兼容 dict/str/list 各种形态
