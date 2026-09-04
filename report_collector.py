@@ -75,6 +75,27 @@ REPORT_REPOSITORIES = {
         "base": "https://cdn.unrisd.org", "api": "dspace",
         "note": "联合国社会发展研究所 (需确认库类型)",
     },
+    # 补充候选：常见国际组织 DSpace 报告库（待服务器 check 验证 URL）
+    "WFP": {
+        "base": "https://repository.wfp.org", "api": "dspace",
+        "note": "世界粮食计划署 DSpace(候选)",
+    },
+    "ECLAC": {
+        "base": "https://repositorio.cepal.org", "api": "dspace",
+        "note": "拉美经委会 DSpace(候选,西语多含英文)",
+    },
+    "UNECA": {
+        "base": "https://repository.uneca.org", "api": "dspace",
+        "note": "联合国非洲经委会(候选)",
+    },
+    "UNICEF": {
+        "base": "https://open.unicef.org", "api": "dspace",
+        "note": "联合国儿童基金会(候选)",
+    },
+    "IOM": {
+        "base": "https://iom.rechord.net", "api": "dspace",
+        "note": "国际移民组织(候选,需确认)",
+    },
     # 非 DSpace（预留，后续适配）
     "FAO": {"base": "", "api": "todo", "note": "粮农组织文档库(未适配)"},
     "ADB": {"base": "", "api": "todo", "note": "亚洲开发银行(未适配)"},
