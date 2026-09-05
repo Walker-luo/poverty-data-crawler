@@ -31,6 +31,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+import subprocess
+import urllib.parse
 
 import requests
 import urllib3
@@ -140,25 +142,57 @@ class DSpaceRepository:
         self.api = f"{self.base}/server/api"
         self.name = org_name
 
+    def _fetch(self, url: str, params: Optional[Dict] = None):
+        """requests 优先；SSL/连接失败时 curl -sk fallback
+
+        解决部分机构（WorldBank/IFAD/WFP 等）在 macOS/部分环境的
+        TLS 兼容问题（requests/urllib3 握手 EOF，但 curl 能通）。
+        返回类 response 对象（.json/.text/.content），失败返回 None。
+        """
+        try:
+            resp = self.session.get(url, params=params, timeout=30,
+                                    verify=False)
+            if resp.status_code < 500:
+                return resp
+            logger.warning(f"  {self.org_name} HTTP {resp.status_code} "
+                           f"→ curl fallback")
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            logger.warning(f"  {self.org_name} requests "
+                           f"{type(e).__name__} → curl fallback")
+        # curl fallback（-k 忽略证书，解决 TLS 兼容）
+        qs = urllib.parse.urlencode(params or {})
+        full = f"{url}?{qs}" if qs else url
+        try:
+            r = subprocess.run(["curl", "-sk", "-m", "30", full],
+                               capture_output=True, timeout=35)
+            if r.returncode == 0 and r.stdout:
+                class Ctx:
+                    status_code = 200
+                c = Ctx()
+                c.text = r.stdout.decode("utf-8", errors="ignore")
+                c.content = r.stdout
+                c.json = lambda t=c.text: json.loads(t)
+                return c
+        except Exception:
+            pass
+        return None
+
     # ---- 检索 ----
     def search(self, query: str, page: int = 0,
                size: int = 20) -> Optional[List[Dict]]:
         url = f"{self.api}/discover/search/objects"
+        resp = self._fetch(url, params={"query": query, "page": page,
+                                        "size": size})
+        if resp is None:
+            return None
         try:
-            resp = self.session.get(
-                url, params={"query": query, "page": page, "size": size},
-                timeout=30, verify=False,
-            )
-            if resp.status_code == 429:
-                logger.warning(f"{self.org_name} 限流(429)，等待 10s...")
-                time.sleep(10)
-                return None
-            resp.raise_for_status()
             d = resp.json()
             sr = d.get("_embedded", {}).get("searchResult", {})
             objects = sr.get("_embedded", {}).get("objects", [])
             return [o["_embedded"]["indexableObject"] for o in objects]
-        except requests.RequestException:
+        except Exception:
             return None
 
     def fetch(self, query: str, limit: Optional[int] = None) -> List[Dict]:
@@ -212,17 +246,16 @@ class DSpaceRepository:
         """返回 (pdf_url, txt_url)。txt 是 DSpace 提取的全文文本，主题建模首选。"""
         pdf_url = txt_url = ""
         try:
-            resp = self.session.get(
-                f"{self.api}/core/items/{uuid}/bundles", timeout=30,
-                verify=False,
-            )
+            resp = self._fetch(f"{self.api}/core/items/{uuid}/bundles")
+            if resp is None:
+                return "", ""
             bundles = resp.json().get("_embedded", {}).get("bundles", [])
             for b in bundles:
                 bname = (b.get("name") or "").upper()
-                r2 = self.session.get(
-                    f"{self.api}/core/bundles/{b['uuid']}/bitstreams",
-                    timeout=30, verify=False,
-                )
+                r2 = self._fetch(
+                    f"{self.api}/core/bundles/{b['uuid']}/bitstreams")
+                if r2 is None:
+                    continue
                 for bf in r2.json().get("_embedded", {}).get("bitstreams", []):
                     fname = (bf.get("name") or "").lower()
                     c_url = f"{self.api}/core/bitstreams/{bf['uuid']}/content"
@@ -305,22 +338,25 @@ class ReportCollector:
 
     def check_orgs(self, query: str = "poverty alleviation",
                    size: int = 1) -> List[str]:
-        """探测各机构库可用性，返回可用机构列表（不采集）"""
-        logger.info("🔍 机构库可用性探测（每机构发 1 次测试请求）：")
+        """探测各机构库可用性，返回可用机构列表（不采集）
+
+        用 repo._fetch（requests + curl 兜底），自动兼容 TLS 问题。
+        """
+        logger.info("🔍 机构库可用性探测（requests + curl 兜底）：")
         available = []
         for repo in self.repos:
-            try:
-                items = repo.search(query, page=0, size=size)
-                if items is not None:
-                    logger.info(f"  ✅ {repo.name}: 可用 "
-                                f"({REPORT_REPOSITORIES[repo.name]['note']})")
-                    available.append(repo.name)
-                else:
-                    logger.warning(f"  ❌ {repo.name}: 请求失败/不可达 "
-                                   f"({REPORT_REPOSITORIES[repo.name]['note']})")
-            except Exception as e:
-                logger.warning(f"  ❌ {repo.name}: {type(e).__name__} "
-                               f"({REPORT_REPOSITORIES[repo.name]['note']})")
+            note = REPORT_REPOSITORIES[repo.name]["note"]
+            url = f"{repo.api}/discover/search/objects"
+            resp = repo._fetch(url, params={"query": query, "page": 0,
+                                            "size": size})
+            if resp is not None and "_embedded" in resp.text:
+                available.append(repo.name)
+                logger.info(f"  ✅ {repo.name}: 可用 ({note})")
+            elif resp is not None:
+                logger.warning(f"  ❌ {repo.name}: 非 DSpace 响应 ({note})")
+            else:
+                logger.warning(f"  ❌ {repo.name}: requests+curl 均不可达 "
+                               f"({note})")
         logger.info(
             f"\n📋 可用机构: {available}\n"
             f"   全量采集: python report_collector.py --org "
@@ -476,20 +512,36 @@ class ReportCollector:
         return downloaded
 
     def _dl(self, url: str, path: Path) -> bool:
-        """下载并校验（PDF 用 %PDF magic，TXT 非空）"""
+        """下载并校验（PDF 用 %PDF magic，TXT 非空）；requests 失败 curl 兜底"""
+        content = None
         try:
             resp = self.session.get(url, timeout=60, verify=False)
-            if resp.status_code != 200 or not resp.content:
+            if resp.status_code == 200 and resp.content:
+                content = resp.content
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout):
+            pass
+        if content is None:
+            # curl 兜底（解决本机 TLS 兼容）
+            try:
+                r = subprocess.run(
+                    ["curl", "-sk", "-m", "60", "-o", str(path), url],
+                    capture_output=True, timeout=70)
+                if r.returncode == 0 and path.exists() \
+                        and path.stat().st_size > 100:
+                    content = path.read_bytes()
+                else:
+                    return False
+            except Exception:
                 return False
-            content = resp.content
-            if path.suffix == ".pdf" and content[:4] != b"%PDF":
-                return False
-            if len(content) < 100:
-                return False
-            path.write_bytes(content)
-            return True
-        except requests.RequestException:
+        # 校验内容有效
+        if path.suffix == ".pdf" and content[:4] != b"%PDF":
             return False
+        if len(content) < 100:
+            return False
+        path.write_bytes(content)
+        return True
 
 
 def main():
