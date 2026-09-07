@@ -468,47 +468,103 @@ class ReportCollector:
 
         pdf 优先（原始报告，可读/保留图表）；pdf 缺失时用 txt 兜底。
         include_txt=True 时额外下载 txt（DSpace 提取的全文文本，主题建模用）。
+
+        命名规则: fulltext/{handle 的 / 换成 _}.{ext}，
+        例: handle 10665/62630 → 10665_62630.pdf（handle 全局唯一，可对应原页面）。
+        记录: download_log.json（每篇 pdf/txt 状态，断点续传）
+            + download_fail.log（失败明细，追加）
         """
         if not reports:
             return 0
         ft_dir = self.out_dir / "fulltext"
         ft_dir.mkdir(parents=True, exist_ok=True)
         todo = reports[:limit] if limit else reports
-        downloaded = fail = 0
+
+        # 下载记录（断点续传 + 可追溯）
+        log_path = ft_dir / "download_log.json"
+        log = {}
+        if log_path.exists():
+            try:
+                log = json.loads(log_path.read_text(encoding="utf-8"))
+            except Exception:
+                log = {}
 
         # 机构 → repo 映射
         repo_map = {r.name: r for r in self.repos}
+        downloaded = skipped = fail = 0
+        failures: List[str] = []
 
         for i, w in enumerate(todo, 1):
+            handle = w.get("handle", "") or w.get("id", "x")
+            entry = log.setdefault(
+                handle, {"title": (w.get("title") or "")[:60]})
+            # 断点续传：任一格式已成功 → 跳过
+            if entry.get("pdf") == "ok" or entry.get("txt") == "ok":
+                skipped += 1
+                continue
+
             repo = repo_map.get(w.get("institution"))
-            if not repo:
+            if not repo or not w.get("id"):
+                entry.setdefault("pdf", "fail")
+                entry.setdefault("txt", "fail")
+                fail += 1
+                failures.append(f"{handle} | 机构不可用")
                 continue
-            uuid = w.get("id")
-            if not uuid:
-                continue
-            pdf_url, txt_url = repo.get_content_links(uuid)
-            base_name = w.get("handle", "x").replace("/", "_")
+
+            pdf_url, txt_url = repo.get_content_links(w["id"])
+            base_name = handle.replace("/", "_") or w["id"]
             got = False
-            # 1. PDF 优先（原始报告，保留图表/版式）
+            # 1) PDF 优先：有 pdf_url 就下 PDF（成功即完成本报告）
             if pdf_url:
-                if self._dl(pdf_url, ft_dir / f"{base_name}.pdf"):
-                    got = True
-            # 2. PDF 缺失 → txt 兜底（DSpace 提取的全文文本）
-            if not got and txt_url:
-                if self._dl(txt_url, ft_dir / f"{base_name}.txt"):
-                    got = True
-            # 3. 可选：已下 PDF 再额外下 txt（主题建模全文语料）
-            if got and include_txt and txt_url:
-                self._dl(txt_url, ft_dir / f"{base_name}.txt")
+                pdf_ok = self._dl(pdf_url, ft_dir / f"{base_name}.pdf")
+                entry["pdf"] = "ok" if pdf_ok else "fail"
+                got = pdf_ok
+            else:
+                entry["pdf"] = "not_found"
+            # 2) PDF 未成功 → txt 兜底
+            if not got:
+                if txt_url:
+                    txt_ok = self._dl(
+                        txt_url, ft_dir / f"{base_name}.txt")
+                    entry["txt"] = "ok" if txt_ok else "fail"
+                    got = txt_ok
+                else:
+                    entry["txt"] = "not_found"
+            # 3) PDF 已成功时默认不下 txt；仅显式 --include-txt 才额外补
+            elif include_txt and txt_url:
+                entry["txt"] = "ok" if self._dl(
+                    txt_url, ft_dir / f"{base_name}.txt") else "fail"
+
             if got:
                 downloaded += 1
             else:
                 fail += 1
+                failures.append(f"{handle} | 无全文")
             if i % 20 == 0 or i == len(todo):
-                logger.info(f"  全文进度: {i}/{len(todo)} | ✓{downloaded} ✗{fail}")
+                logger.info(
+                    f"  ⏳ 下载进度: {i}/{len(todo)} | "
+                    f"✓{downloaded} ⊘跳过{skipped} ✗{fail}")
             time.sleep(self.delay)
 
-        logger.info(f"✅ 全文下载完成: {downloaded} 篇 | 失败 {fail} 篇")
+        # 保存下载记录
+        log_path.write_text(
+            json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 失败明细（追加累积）
+        if failures:
+            fail_log = ft_dir / "download_fail.log"
+            with open(fail_log, "a", encoding="utf-8") as f:
+                f.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"Report Download: {len(todo)} 篇\n")
+                for line in failures:
+                    f.write(f"  ✗ {line}\n")
+            logger.info(f"  ❌ 失败明细: {fail_log} ({len(failures)} 篇)")
+            for line in failures[:10]:
+                logger.info(f"     ✗ {line}")
+
+        logger.info(
+            f"✅ 全文下载完成: ✓新下 {downloaded} | ⊘跳过 {skipped} "
+            f"| ✗失败 {fail}")
+        logger.info(f"   📋 下载记录: {log_path}")
         return downloaded
 
     def _dl(self, url: str, path: Path) -> bool:
