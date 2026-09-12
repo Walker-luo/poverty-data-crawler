@@ -479,6 +479,7 @@ class ReportCollector:
         ft_dir = self.out_dir / "fulltext"
         ft_dir.mkdir(parents=True, exist_ok=True)
         todo = reports[:limit] if limit else reports
+        logger.info(f"📥 本次需下载: {len(todo)} 篇")
 
         # 下载记录（断点续传 + 可追溯）
         log_path = ft_dir / "download_log.json"
@@ -565,25 +566,41 @@ class ReportCollector:
             f"✅ 全文下载完成: ✓新下 {downloaded} | ⊘跳过 {skipped} "
             f"| ✗失败 {fail}")
         logger.info(f"   📋 下载记录: {log_path}")
+
+        # 整体下载统计（最新一次运行，覆盖写，方便查看）
+        summary = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "need": len(todo),          # 本次需要下载
+            "downloaded": downloaded,   # 本次新下载成功
+            "skipped": skipped,         # 已下载/已有，跳过
+            "failed": fail,             # 失败
+            "done_total": len([v for v in log.values()
+                               if v.get("pdf") == "ok"
+                               or v.get("txt") == "ok"]),  # 累计已下载
+        }
+        sum_path = ft_dir / "download_summary.json"
+        sum_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        logger.info(f"   📊 下载统计: {sum_path}")
         return downloaded
 
     def _dl(self, url: str, path: Path) -> bool:
         """下载并校验（PDF 用 %PDF magic，TXT 非空）；requests 失败 curl 兜底"""
         content = None
         try:
-            resp = self.session.get(url, timeout=60, verify=False)
+            resp = self.session.get(url, timeout=90, verify=False)
             if resp.status_code == 200 and resp.content:
                 content = resp.content
-        except (requests.exceptions.SSLError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout):
-            pass
+        except requests.exceptions.RequestException:
+            # 捕获一切请求异常（含 ChunkedEncodingError/ProtocolError 等）
+            content = None
         if content is None:
-            # curl 兜底（解决本机 TLS 兼容）
+            # curl 兜底（--retry 应对 chunked 断开，-k 解决 TLS 兼容）
             try:
                 r = subprocess.run(
-                    ["curl", "-sk", "-m", "60", "-o", str(path), url],
-                    capture_output=True, timeout=70)
+                    ["curl", "-sk", "-m", "90", "--retry", "3",
+                     "-o", str(path), url],
+                    capture_output=True, timeout=100)
                 if r.returncode == 0 and path.exists() \
                         and path.stat().st_size > 100:
                     content = path.read_bytes()
