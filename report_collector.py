@@ -30,7 +30,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import subprocess
 import urllib.parse
 
@@ -474,15 +474,23 @@ class ReportCollector:
         记录: download_log.json（每篇 pdf/txt 状态，断点续传）
             + download_fail.log（失败明细，追加）
         """
-        if not reports:
-            return 0
+        # 先确保结构存在：目录 + download_log.json + download_fail.log
         ft_dir = self.out_dir / "fulltext"
         ft_dir.mkdir(parents=True, exist_ok=True)
+        log_path = ft_dir / "download_log.json"
+        if not log_path.exists():
+            log_path.write_text("{}", encoding="utf-8")
+        fail_log = ft_dir / "download_fail.log"
+        fail_log.touch(exist_ok=True)
+
+        if not reports:
+            logger.warning("⚠️ 无报告可下载（确认 --run-id 的 works.json 非空）")
+            logger.info(f"   📁 已初始化: {ft_dir}")
+            return 0
         todo = reports[:limit] if limit else reports
         logger.info(f"📥 本次需下载: {len(todo)} 篇")
 
         # 下载记录（断点续传 + 可追溯）
-        log_path = ft_dir / "download_log.json"
         log = {}
         if log_path.exists():
             try:
@@ -493,7 +501,11 @@ class ReportCollector:
         # 机构 → repo 映射
         repo_map = {r.name: r for r in self.repos}
         downloaded = skipped = fail = 0
-        failures: List[str] = []
+
+        # fail.log 运行头（无条件，本次概况在最上）
+        with open(fail_log, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"Report Download: 需下载 {len(todo)} 篇\n")
 
         for i, w in enumerate(todo, 1):
             handle = w.get("handle", "") or w.get("id", "x")
@@ -509,63 +521,67 @@ class ReportCollector:
                 entry.setdefault("pdf", "fail")
                 entry.setdefault("txt", "fail")
                 fail += 1
-                failures.append(f"{handle} | 机构不可用")
+                self._append_fail(fail_log, handle, "机构不可用")
                 continue
 
             pdf_url, txt_url = repo.get_content_links(w["id"])
             base_name = handle.replace("/", "_") or w["id"]
             got = False
+            reason = ""
             # 1) PDF 优先：有 pdf_url 就下 PDF（成功即完成本报告）
             if pdf_url:
-                pdf_ok = self._dl(pdf_url, ft_dir / f"{base_name}.pdf")
+                pdf_ok, pdf_reason = self._dl(
+                    pdf_url, ft_dir / f"{base_name}.pdf")
                 entry["pdf"] = "ok" if pdf_ok else "fail"
                 got = pdf_ok
+                reason = "" if pdf_ok else pdf_reason
             else:
                 entry["pdf"] = "not_found"
+                reason = "无PDF链接"
             # 2) PDF 未成功 → txt 兜底
             if not got:
                 if txt_url:
-                    txt_ok = self._dl(
+                    txt_ok, txt_reason = self._dl(
                         txt_url, ft_dir / f"{base_name}.txt")
                     entry["txt"] = "ok" if txt_ok else "fail"
                     got = txt_ok
+                    if not txt_ok:
+                        reason = (reason + "+" + txt_reason) if reason else txt_reason
                 else:
                     entry["txt"] = "not_found"
+                    reason = reason + "+无TXT全文" if reason else "无TXT全文"
             # 3) PDF 已成功时默认不下 txt；仅显式 --include-txt 才额外补
             elif include_txt and txt_url:
-                entry["txt"] = "ok" if self._dl(
-                    txt_url, ft_dir / f"{base_name}.txt") else "fail"
+                txt_ok, _ = self._dl(
+                    txt_url, ft_dir / f"{base_name}.txt")
+                entry["txt"] = "ok" if txt_ok else "fail"
 
             if got:
                 downloaded += 1
             else:
                 fail += 1
-                failures.append(f"{handle} | 无全文")
+                # 实时写入失败原因（与下载同步）
+                self._append_fail(fail_log, handle, reason or "下载失败")
             if i % 20 == 0 or i == len(todo):
                 logger.info(
                     f"  ⏳ 下载进度: {i}/{len(todo)} | "
                     f"✓{downloaded} ⊘跳过{skipped} ✗{fail}")
+                # 实时写 download_log（与进度同步，中断保留）
+                log_path.write_text(
+                    json.dumps(log, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
             time.sleep(self.delay)
 
-        # 保存下载记录
+        # 最终写一次 download_log（确保完整）
         log_path.write_text(
             json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
-        # 失败明细（追加累积）
-        if failures:
-            fail_log = ft_dir / "download_fail.log"
-            with open(fail_log, "a", encoding="utf-8") as f:
-                f.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-                        f"Report Download: {len(todo)} 篇\n")
-                for line in failures:
-                    f.write(f"  ✗ {line}\n")
-            logger.info(f"  ❌ 失败明细: {fail_log} ({len(failures)} 篇)")
-            for line in failures[:10]:
-                logger.info(f"     ✗ {line}")
 
         logger.info(
             f"✅ 全文下载完成: ✓新下 {downloaded} | ⊘跳过 {skipped} "
             f"| ✗失败 {fail}")
         logger.info(f"   📋 下载记录: {log_path}")
+        if fail > 0:
+            logger.info(f"   ❌ 失败明细（实时记录）: {fail_log}")
 
         # 整体下载统计（最新一次运行，覆盖写，方便查看）
         summary = {
@@ -584,15 +600,27 @@ class ReportCollector:
         logger.info(f"   📊 下载统计: {sum_path}")
         return downloaded
 
-    def _dl(self, url: str, path: Path) -> bool:
-        """下载并校验（PDF 用 %PDF magic，TXT 非空）；requests 失败 curl 兜底"""
+    def _append_fail(self, fail_log: Path, handle: str, reason: str) -> None:
+        """实时追加一条失败到 download_fail.log（与下载同步）"""
+        with open(fail_log, "a", encoding="utf-8") as f:
+            f.write(f"  ✗ {handle} | {reason}\n")
+
+    def _dl(self, url: str, path: Path) -> Tuple[bool, str]:
+        """下载并校验（PDF 用 %PDF magic，TXT 非空）；requests 失败 curl 兜底
+
+        Returns:
+            (True, "ok") 成功；或 (False, 具体原因)（HTTP码/chunked/校验失败等）
+        """
         content = None
+        reason = ""
         try:
             resp = self.session.get(url, timeout=90, verify=False)
             if resp.status_code == 200 and resp.content:
                 content = resp.content
-        except requests.exceptions.RequestException:
-            # 捕获一切请求异常（含 ChunkedEncodingError/ProtocolError 等）
+            else:
+                reason = f"HTTP {resp.status_code}"
+        except requests.exceptions.RequestException as e:
+            reason = type(e).__name__  # ChunkedEncodingError/SSLError/Timeout...
             content = None
         if content is None:
             # curl 兜底（--retry 应对 chunked 断开，-k 解决 TLS 兼容）
@@ -605,16 +633,16 @@ class ReportCollector:
                         and path.stat().st_size > 100:
                     content = path.read_bytes()
                 else:
-                    return False
-            except Exception:
-                return False
+                    return False, reason or f"curl失败(rc={r.returncode})"
+            except Exception as e:
+                return False, reason or f"curl异常 {type(e).__name__}"
         # 校验内容有效
         if path.suffix == ".pdf" and content[:4] != b"%PDF":
-            return False
+            return False, "非PDF"
         if len(content) < 100:
-            return False
+            return False, f"内容过短({len(content)})"
         path.write_bytes(content)
-        return True
+        return True, "ok"
 
 
 def main():
