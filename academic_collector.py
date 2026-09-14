@@ -139,7 +139,12 @@ CROSSREF_OFFSET_LIMIT = 10000
 
 # OpenAlex 全文下载 API（content API）
 # 免费注册获取 key: https://openalex.org/users
-OPENALEX_API_KEY = "dke7UcbHWbmO6iYa9rfXOt"              # TODO: 填入你的 OpenAlex API key
+# 可填多个 key（每人各自额度），程序轮换使用，整体额度翻倍
+OPENALEX_API_KEYS = [
+    "dke7UcbHWbmO6iYa9rfXOt",      # key 1（主）
+    # "your-second-openalex-key",   # ⬅ 填入第二个 key，即可双倍额度
+    # "your-third-openalex-key",
+]
 CONTENT_BASE_URL = "https://content.openalex.org/works"
 
 # 检索停用词：标题相关性过滤时，这些词不作为"主题词"判断依据
@@ -225,12 +230,21 @@ class OpenAlexSource:
     ])
 
     def __init__(self, session: requests.Session, mailto: str, delay: float,
-                 api_key: str = ""):
+                 api_keys: Optional[List[str]] = None):
         self.session = session
         self.mailto = mailto
         self.delay = delay
-        self.api_key = api_key
+        self.api_keys = api_keys or [""]
+        self._key_idx = 0
         self.name = "openalex"
+
+    def _next_api_key(self) -> str:
+        """轮换返回下一个 API key（多 key 分摊额度）"""
+        if not self.api_keys:
+            return ""
+        key = self.api_keys[self._key_idx % len(self.api_keys)]
+        self._key_idx += 1
+        return key
 
     def search(self, keyword: str, year_filter: str, has_abstract: bool,
                limit: Optional[int], china_specific: bool,
@@ -307,9 +321,12 @@ class OpenAlexSource:
           - SSL/连接/超时 等网络异常 → 指数退避重试 + 重建连接（防坏连接复用）
           - 其他 4xx HTTP 错误 → 优雅返回 None（不重试，永久错误）
         """
-        if self.api_key:
-            params["api-key"] = self.api_key
-        for attempt in range(retries):
+        n_keys = max(1, len(self.api_keys))
+        budget_hits = 0
+        for attempt in range(retries + n_keys):
+            key = self._next_api_key()
+            if key:
+                params["api-key"] = key
             try:
                 resp = self.session.get(
                     self.BASE_URL, params=params, timeout=30)
@@ -317,7 +334,14 @@ class OpenAlexSource:
                     # 区分：额度用完 vs 普通限流
                     if ("Insufficient budget" in resp.text
                             or "budget" in resp.text):
-                        raise BudgetExhausted()
+                        # 该 key 额度用完 → 换下一个 key 继续
+                        budget_hits += 1
+                        if budget_hits >= n_keys:
+                            raise BudgetExhausted()  # 所有 key 用尽
+                        logger.warning(
+                            f"OpenAlex 某 key 额度用完，切换下一个 "
+                            f"({budget_hits}/{n_keys})")
+                        continue
                     logger.warning(f"OpenAlex 限流(429)，等待 10s...")
                     time.sleep(10)
                     return None
@@ -634,7 +658,9 @@ class AcademicCollector:
                  out_dir: Optional[str] = None):
         self.mailto = mailto
         self.delay = delay
-        self.api_key = api_key or OPENALEX_API_KEY
+        # API key 支持多个：CLI 传的（逗号/空格分隔）优先，否则用配置列表
+        self.api_keys = self._parse_keys(api_key)
+        self._key_idx = 0
         self.session = requests.Session()
         self.session.headers["User-Agent"] = f"poverty-research/1.0 (mailto:{mailto})"
         self.resume_run = resume_run
@@ -646,7 +672,7 @@ class AcademicCollector:
         self.sources = []
         if source in ("openalex", "all"):
             self.sources.append(OpenAlexSource(self.session, mailto, delay,
-                                               self.api_key))
+                                               self.api_keys))
         if source in ("crossref", "all"):
             self.sources.append(CrossrefSource(self.session, mailto, delay))
 
@@ -660,6 +686,23 @@ class AcademicCollector:
             self.run_id = run_id or resume_run or datetime.now().strftime("%Y%m%d_%H%M%S")
             self.out_dir = Path(f"data/processed/academic/{self.run_id}")
         self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _parse_keys(api_key: str) -> List[str]:
+        """解析 API key：CLI 传入（逗号/空格分隔）优先，否则用配置列表"""
+        src = api_key.strip() if api_key else ""
+        if not src:
+            return list(OPENALEX_API_KEYS)
+        # 支持 "k1,k2" 或 "k1 k2"
+        return [k for k in src.replace(",", " ").split() if k]
+
+    def _next_api_key(self) -> str:
+        """轮换返回下一个 API key（多 key 分摊额度）"""
+        if not self.api_keys:
+            return ""
+        key = self.api_keys[self._key_idx % len(self.api_keys)]
+        self._key_idx += 1
+        return key
 
     def load_run(self) -> List[Dict]:
         """读取已有 run 的 works.json
@@ -1093,11 +1136,11 @@ class AcademicCollector:
         Returns:
             下载成功（含断点续传跳过）的篇数
         """
-        if not self.api_key:
+        if not self.api_keys:
             logger.warning(
                 "⚠️ 未设置 OpenAlex API key，跳过全文下载。\n"
                 "   免费注册: https://openalex.org/users 后在脚本顶部 "
-                "OPENALEX_API_KEY 或 --api-key 填入。"
+                "OPENALEX_API_KEYS 或 --api-key 填入（多个 key 用逗号分隔）。"
             )
             return 0
 
@@ -1331,42 +1374,53 @@ class AcademicCollector:
 
     def _download_content_api(self, oa_id: str, fmt: str,
                               out_path: Path) -> str:
-        """从 content API 下载单个格式
+        """从 content API 下载单个格式（多 key 轮换）
 
-        Returns: ok / not_found / budget(额度用完,应停止) / fail
+        单 key 额度用完 → 自动切下一个 key；所有 key 用尽才返回 budget。
+
+        Returns: ok / not_found / budget(所有 key 用尽) / fail
         """
-        url = f"{CONTENT_BASE_URL}/{oa_id}.{fmt}?api_key={self.api_key}"
-        try:
-            resp = self.session.get(url, timeout=60)
-            if resp.status_code == 200 and len(resp.content) > 100:
-                content = resp.content
-                # content API 的 XML 是 gzip 压缩的，自动解压
-                if content[:2] == b"\x1f\x8b":
-                    try:
-                        content = gzip.decompress(content)
-                    except OSError:
-                        pass
-                out_path.write_bytes(content)
-                return "ok"
-            if resp.status_code == 404:
-                return "not_found"
-            if resp.status_code == 429:
-                # 额度用完 → 终止全量下载（避免每篇报"下载失败"刷屏）
-                if ("Insufficient budget" in resp.text
-                        or "budget" in resp.text):
-                    return "budget"
-                time.sleep(10)  # 普通限流退避
-                return "fail"
-            if resp.status_code in (502, 503, 504):
-                time.sleep(5)  # 服务器繁忙，重试一次
+        n_keys = max(1, len(self.api_keys))
+        budget_hits = 0
+        for _ in range(n_keys):
+            key = self._next_api_key()
+            url = f"{CONTENT_BASE_URL}/{oa_id}.{fmt}?api_key={key}"
+            try:
                 resp = self.session.get(url, timeout=60)
-                if resp.status_code == 200 and 100 < len(resp.content):
-                    out_path.write_bytes(resp.content)
+                if resp.status_code == 200 and len(resp.content) > 100:
+                    content = resp.content
+                    # content API 的 XML 是 gzip 压缩的，自动解压
+                    if content[:2] == b"\x1f\x8b":
+                        try:
+                            content = gzip.decompress(content)
+                        except OSError:
+                            pass
+                    out_path.write_bytes(content)
                     return "ok"
+                if resp.status_code == 404:
+                    return "not_found"
+                if resp.status_code == 429:
+                    if ("Insufficient budget" in resp.text
+                            or "budget" in resp.text):
+                        # 该 key 额度用完 → 换下一个 key 继续
+                        budget_hits += 1
+                        logger.warning(
+                            f"  某 key 额度用完，切换下一个 "
+                            f"({budget_hits}/{n_keys})")
+                        continue
+                    time.sleep(10)  # 普通限流退避
+                    return "fail"
+                if resp.status_code in (502, 503, 504):
+                    time.sleep(5)  # 服务器繁忙，重试一次
+                    resp = self.session.get(url, timeout=60)
+                    if resp.status_code == 200 and len(resp.content) > 100:
+                        out_path.write_bytes(resp.content)
+                        return "ok"
+                    return "fail"
                 return "fail"
-            return "fail"
-        except requests.RequestException:
-            return "fail"
+            except requests.RequestException:
+                return "fail"
+        return "budget"  # 所有 key 额度用完
 
     @staticmethod
     def _download_oa_url(oa_url: str, out_path: Path) -> bool:
@@ -1412,7 +1466,8 @@ def main():
                              "参考: 首页median≈420, 第5页≈153, 第11页≈101")
     parser.add_argument("--mailto", default=MAILTO)
     parser.add_argument("--api-key", default="",
-                        help="OpenAlex API key（全文下载用，免费注册 openalex.org/users）")
+                        help="OpenAlex API key（可用多个，逗号分隔，轮换提升额度。"
+                             "免费注册 openalex.org/users）")
     parser.add_argument("--fulltext", choices=["grobid-xml", "pdf", "both", "none"],
                         default="none",
                         help="采集后下载全文: pdf(优先,通用) | grobid-xml(结构化,主题建模) "
