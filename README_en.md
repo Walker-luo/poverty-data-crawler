@@ -6,8 +6,8 @@
 
 | 层 | 内容 | 脚本 | 数据目录 |
 |----|------|------|---------|
-| **① 学术文献** | OpenAlex / Crossref 论文（引用/概念/机构） | [collect_english.py](collect_english.py) | `data/processed/academic/` |
-| **② 官方组织报告** | WHO/World Bank 等 DSpace 报告库（含全文） | [report_collector.py](report_collector.py) | `data/processed/report/` |
+| **① 学术文献** | OpenAlex / Crossref 论文（引用/概念/机构） | [academic_collector.py](academic_collector.py) + [academic_export_csv.py](academic_export_csv.py) | `data/processed/academic/` |
+| **② 官方组织报告** | WHO/World Bank 等 DSpace 报告库（含全文） | [report_collector.py](report_collector.py) + [report_export_csv.py](report_export_csv.py) | `data/processed/report/` |
 | **③ 国际新闻** | 国际英文媒体（规划中） | - | `data/processed/env_news/` |
 
 三者统一 `source_type` 字段（`academic` / `report` / `news`），后续合并建图。
@@ -30,13 +30,13 @@
 
 ```bash
 # 用 OpenAlex（字段最全），额度用完自动切 Crossref
-python collect_english.py
+python academic_collector.py
 
 # 用 Crossref（免费无限量）
-python collect_english.py --source crossref
+python academic_collector.py --source crossref
 
 # 小批量测试（每个关键词限 2 条）
-python collect_english.py --limit 2
+python academic_collector.py --limit 2
 ```
 
 ## 常用命令
@@ -47,15 +47,15 @@ OpenAlex 默认主源，`--min-relevance` 相关性触底自动停。每天一�
 
 ```bash
 # 第1天: 组1 核心战略           第2天: 组2 共同富裕+攻坚
-python collect_english.py --group 1 --min-relevance 100
-python collect_english.py --group 2 --min-relevance 100
+python academic_collector.py --group 1 --min-relevance 100
+python academic_collector.py --group 2 --min-relevance 100
 
 # 第3天: 组3 产业/领域          第4天: 组4 健康+通用
-python collect_english.py --group 3 --min-relevance 100
-python collect_english.py --group 4 --min-relevance 100
+python academic_collector.py --group 3 --min-relevance 100
+python academic_collector.py --group 4 --min-relevance 100
 
 # 第5天: 组5 减贫学术
-python collect_english.py --group 5 --min-relevance 100
+python academic_collector.py --group 5 --min-relevance 100
 ```
 
 跑完 5 天一轮后，隔一段时间再轮转一遍补充新文献（跨 run 自动去重，只付新增费用）。
@@ -66,10 +66,10 @@ python collect_english.py --group 5 --min-relevance 100
 
 ```bash
 # ① OpenAlex 全量爬取元数据（15 词，--min-relevance 相关性触底自动停）
-python collect_english.py --source openalex --min-relevance 100
+python academic_collector.py --source openalex --min-relevance 100
 
 # ② OpenAlex 结束后，Crossref 补充（无限量，标题精准检索，自动跳过已采的 DOI）
-python collect_english.py --source crossref --max-pages 5
+python academic_collector.py --source crossref --max-pages 5
 ```
 
 > **说明**：OpenAlex 字段最全（摘要/概念/引用），Crossref 无限量但几乎无摘要。
@@ -80,19 +80,22 @@ python collect_english.py --source crossref --max-pages 5
 
 ```bash
 # ① 建库前小批量测试（先验证 API 和检索正常）
-python collect_english.py --source crossref --keywords "targeted poverty alleviation" --limit 5 --max-pages 1
+python academic_collector.py --source crossref --keywords "targeted poverty alleviation" --limit 5 --max-pages 1
 
 # ② 查看组状态（运行前自动打印各组已采集情况）
-python collect_english.py --group 1
+python academic_collector.py --group 1
 
 # ③ 采集 + 下载全文（grobid-xml 主题建模语料）
-python collect_english.py --group 1 --min-relevance 100 --fulltext grobid-xml
+python academic_collector.py --group 1 --min-relevance 100 --fulltext grobid-xml
 
 # ④ 对已有 run 补下载全文（不重新采集）
-python collect_english.py --run-id <RUN_ID> --fulltext grobid-xml
+python academic_collector.py --run-id <RUN_ID> --fulltext grobid-xml
 
 # ⑤ 引文扩展（从已采文献的引用关系继续挖相关文献，需 OpenAlex 源）
-python collect_english.py --run-id <OPENALEX_RUN_ID> --expand-references --expand-limit 2000
+python academic_collector.py --run-id <OPENALEX_RUN_ID> --expand-references --expand-limit 2000
+
+# ⑥ 导出数据库导入 CSV（不重新爬取、不调用 OpenAlex API）
+python academic_export_csv.py --run-id <RUN_ID>
 ```
 
 ## 环境准备
@@ -121,8 +124,8 @@ pip install requests
 
 | 位置 | 说明 |
 |------|------|
-| [collect_english.py:95](collect_english.py#L95) `MAILTO` | polite pool 邮箱标识 |
-| [collect_english.py:101](collect_english.py#L101) `OPENALEX_API_KEY` | 你的 OpenAlex API key（或 `--api-key`） |
+| [academic_collector.py:95](academic_collector.py#L95) `MAILTO` | polite pool 邮箱标识 |
+| [academic_collector.py:101](academic_collector.py#L101) `OPENALEX_API_KEY` | 你的 OpenAlex API key（或 `--api-key`） |
 
 ### `--source` 数据源
 
@@ -143,14 +146,14 @@ pip install requests
 
 ```bash
 # 自定义关键词
-python collect_english.py --keywords "common prosperity" "rural revitalization"
+python academic_collector.py --keywords "common prosperity" "rural revitalization"
 ```
 
 ### `--years` 限定年份
 
 ```bash
-python collect_english.py --years 2013 2020   # 限定 2013-2020
-python collect_english.py --years 2000        # 单年
+python academic_collector.py --years 2013 2020   # 限定 2013-2020
+python academic_collector.py --years 2000        # 单年
 ```
 不指定则覆盖 2000 至今。
 
@@ -159,7 +162,7 @@ python collect_english.py --years 2000        # 单年
 仅对 OpenAlex 生效（OpenAlex 摘要覆盖率约 20-50%）：
 
 ```bash
-python collect_english.py --source openalex --has-abstract
+python academic_collector.py --source openalex --has-abstract
 ```
 
 ### `--limit` 限制数量
@@ -167,7 +170,7 @@ python collect_english.py --source openalex --has-abstract
 每个关键词限制条数（测试用）：
 
 ```bash
-python collect_english.py --limit 2    # 每个关键词限 2 条，快速验证
+python academic_collector.py --limit 2    # 每个关键词限 2 条，快速验证
 ```
 
 ### `--max-pages` 限制翻页深度（防额度失控）
@@ -177,10 +180,10 @@ python collect_english.py --limit 2    # 每个关键词限 2 条，快速验证
 
 ```bash
 # 每关键词最多翻 5 页（5×200=1000 条/关键词，覆盖高相关部分）
-python collect_english.py --max-pages 5
+python academic_collector.py --max-pages 5
 
 # 每关键词 1 页（200 条，快，实测 1 秒采到 81 条高相关）
-python collect_english.py --max-pages 1
+python academic_collector.py --max-pages 1
 ```
 
 **额度估算**（15 关键词全量）：
@@ -201,7 +204,7 @@ python collect_english.py --max-pages 1
 ```bash
 # 强相关词自动挖深（实测 targeted poverty alleviation → 3页 +465条）
 # 弱相关词自动浅爬（实测 poverty dynamics → 1页 +32条）
-python collect_english.py --min-relevance 100
+python academic_collector.py --min-relevance 100
 ```
 
 relevance_score 参考值（实测 "targeted poverty alleviation China"）：
@@ -229,8 +232,8 @@ relevance_score 参考值（实测 "targeted poverty alleviation China"）：
 内置 15 个关键词分为 **5 组，每组仅 3 词**，每天手动选择爬哪一组，配合跨 run 去重避免额度浪费：
 
 ```bash
-python collect_english.py --group 1      # 只爬组1（3 词）
-python collect_english.py --group 4 5    # 爬组4 + 组5
+python academic_collector.py --group 1      # 只爬组1（3 词）
+python academic_collector.py --group 4 5    # 爬组4 + 组5
 ```
 
 | 组号 | 关键词 | 主题 |
@@ -268,9 +271,9 @@ python collect_english.py --group 4 5    # 爬组4 + 组5
 
 ```bash
 # --source 默认就是 openalex，无需显式写
-python collect_english.py --group 1                    # OpenAlex 爬组1（默认）
-python collect_english.py --group 1 --source crossref  # 改用 Crossref 爬组1
-python collect_english.py --group 1 --source all       # OpenAlex 为主，额度用完切 Crossref
+python academic_collector.py --group 1                    # OpenAlex 爬组1（默认）
+python academic_collector.py --group 1 --source crossref  # 改用 Crossref 爬组1
+python academic_collector.py --group 1 --source all       # OpenAlex 为主，额度用完切 Crossref
 ```
 
 | 组合 | 效果 | 适用 |
@@ -288,11 +291,11 @@ python collect_english.py --group 1 --source all       # OpenAlex 为主，额�
 
 ```bash
 # 第1天 ~ 第5天，每天一组，每组 3 词 × 3-15 页 ≈ 9-45 次请求
-python collect_english.py --group 1 --min-relevance 100   # 第1天
-python collect_english.py --group 2 --min-relevance 100   # 第2天
-python collect_english.py --group 3 --min-relevance 100   # 第3天
-python collect_english.py --group 4 --min-relevance 100   # 第4天
-python collect_english.py --group 5 --min-relevance 100   # 第5天
+python academic_collector.py --group 1 --min-relevance 100   # 第1天
+python academic_collector.py --group 2 --min-relevance 100   # 第2天
+python academic_collector.py --group 3 --min-relevance 100   # 第3天
+python academic_collector.py --group 4 --min-relevance 100   # 第4天
+python academic_collector.py --group 5 --min-relevance 100   # 第5天
 ```
 
 ### `--fulltext` 下载全文
@@ -306,7 +309,7 @@ python collect_english.py --group 5 --min-relevance 100   # 第5天
 
 ```bash
 # 采集 + 下载全文（需 API key）
-python collect_english.py --source openalex --fulltext both
+python academic_collector.py --source openalex --fulltext both
 ```
 
 ### `--fulltext-limit` 小批量测试全文（增量推进）
@@ -315,10 +318,10 @@ python collect_english.py --source openalex --fulltext both
 
 ```bash
 # 第 1 次：下载前 3 篇待下载的（约 $0.03，十几秒）
-python collect_english.py --run-id 20260829_161402 --fulltext pdf --fulltext-limit 3
+python academic_collector.py --run-id 20260829_161402 --fulltext pdf --fulltext-limit 3
 
 # 第 2 次：跳过已处理的 3 篇，下载接下来的 3 篇 → 累积 6 篇
-python collect_english.py --run-id 20260829_161402 --fulltext pdf --fulltext-limit 3
+python academic_collector.py --run-id 20260829_161402 --fulltext pdf --fulltext-limit 3
 ```
 
 日志确认推进：
@@ -366,10 +369,10 @@ python collect_english.py --run-id 20260829_161402 --fulltext pdf --fulltext-lim
 
 ```bash
 # 下载全文到指定目录（配合 --run-id 加载数据、--fulltext-limit 小批量测试）
-python collect_english.py --run-id 20260829_161402 --fulltext pdf --fulltext-limit 3 --out-dir /path/to/export
+python academic_collector.py --run-id 20260829_161402 --fulltext pdf --fulltext-limit 3 --out-dir /path/to/export
 
 # 采集数据到指定目录
-python collect_english.py --source openalex --min-relevance 100 --out-dir /path/to/export
+python academic_collector.py --source openalex --min-relevance 100 --out-dir /path/to/export
 ```
 
 > `--run-id X --out-dir Y`：从 X 加载文献数据，下载的全文输出到 Y/fulltext/。
@@ -380,7 +383,7 @@ python collect_english.py --source openalex --min-relevance 100 --out-dir /path/
 
 ```bash
 # 只对历史 run 下载全文
-python collect_english.py --run-id 20260826_190330 --fulltext grobid-xml
+python academic_collector.py --run-id 20260826_190330 --fulltext grobid-xml
 ```
 
 ### `--resume-run` 续爬写回原 run 文件夹
@@ -389,7 +392,7 @@ python collect_english.py --run-id 20260826_190330 --fulltext grobid-xml
 
 ```bash
 # 基于 run X 继续采集：跳过 X 已有的 + 新增写回 X（合并去重）
-python collect_english.py --source crossref --resume-run <OPENALEX_RUN_ID> --max-pages 10
+python academic_collector.py --source crossref --resume-run <OPENALEX_RUN_ID> --max-pages 10
 ```
 
 - 去重基准：只跳过指定 run 已采的文献（区别于默认扫描全部历史）
@@ -404,10 +407,10 @@ python collect_english.py --source crossref --resume-run <OPENALEX_RUN_ID> --max
 
 ```bash
 # 从指定 run 的引用中扩展采集，新增写回该 run
-python collect_english.py --run-id <OPENALEX_RUN_ID> --expand-references
+python academic_collector.py --run-id <OPENALEX_RUN_ID> --expand-references
 
 # 限制扩展规模（已采文献引用常达几十万条，建议设上限控制额度）
-python collect_english.py --run-id <OPENALEX_RUN_ID> --expand-references --expand-limit 2000
+python academic_collector.py --run-id <OPENALEX_RUN_ID> --expand-references --expand-limit 2000
 ```
 
 **原理**：
@@ -439,10 +442,10 @@ python collect_english.py --run-id <OPENALEX_RUN_ID> --expand-references --expan
 
 ```bash
 # 默认：明天重跑，自动跳过所有历史 run 已采的文献
-python collect_english.py --source openalex
+python academic_collector.py --source openalex
 
 # 指定基准：只从某 run 续爬（仅跳过该 run 的文献）
-python collect_english.py --source openalex --resume-run 20260827_130902
+python academic_collector.py --source openalex --resume-run 20260827_130902
 ```
 
 **要点**：
@@ -456,11 +459,57 @@ python collect_english.py --source openalex --resume-run 20260827_130902
 data/processed/academic/{run_id}/
 ├── works.csv          # 扁平元数据（列表字段分号分隔）
 ├── works.json         # 完整元数据（嵌套字段保留，知识图谱首选）
+├── db_import.csv      # 数据库导入索引（academic_export_csv.py 生成）
 ├── summary.md         # 统计报告（年份分布、期刊 Top、摘要覆盖率）
 └── fulltext/          # 全文下载 (--fulltext)
     ├── W2078734051.xml    # grobid 结构化全文（主题建模推荐）
     └── W2078734051.pdf    # 原始 PDF
 ```
+
+## 导出数据库导入 CSV（`academic_export_csv.py`）
+
+学术文献采集完成后，用独立脚本导出数据库批量导入 CSV。这个步骤**只读取本地 `works.csv/json` 和 `fulltext/` 文件**，不重新爬取，也不调用 OpenAlex / Crossref API，因此不会消耗额度。
+
+```bash
+python academic_export_csv.py                       # 自动导出最新 run
+python academic_export_csv.py --run-id 20260829_161402
+python academic_export_csv.py --all                 # 合并所有 run（按 DOI/id 去重）
+python academic_export_csv.py --run-id X --no-fulltext-text   # 只用摘要，不解析全文补描述
+python academic_export_csv.py --run-id X --desc-chars 2000    # 描述长度上限
+```
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--run-id` | 最新 run | 指定 `data/processed/academic/{run_id}` |
+| `--all` | 关 | 合并目录下所有 academic run，按 DOI 优先、无 DOI 用 `id` 去重 |
+| `--out` | 该 run 目录 | 自定义 CSV 输出路径 |
+| `--desc-chars` | `1000` | `描述 / 内容` 字符上限 |
+| `--no-fulltext-text` | 关 | 摘要为空时不解析 `fulltext/` 里的 PDF/XML/TXT 补描述，速度最快 |
+
+### 字段映射
+
+| CSV 列 | 来源 |
+|--------|------|
+| `*文件名` | `works.csv` / `works.json` 中的原始 `id`（如 `W2606951880`）；Crossref 无 W ID 时通常是 DOI，不使用标题、不添加扩展名 |
+| `*标题` | `title` |
+| `描述 / 内容` | 摘要优先；摘要为空时从 `fulltext/` 的 XML/TXT/PDF 提取前 `--desc-chars` 字 |
+| `*分类` | 固定 `academic` |
+| `*类型` | 固定 `text` |
+| `*国家` / `地区` | 标题、摘要、关键词或概念命中 China/Chinese/精准扶贫相关英文概念 → `china` / `asia`；否则 `global` / 空 |
+| `关键词` | 元数据关键词、OpenAlex concepts，以及标题/摘要命中的主题词 |
+| `发展阶段` | 中国相关文献按年份推断；非中国相关文献留空 |
+| `*话语类型` | 固定 `academic`（学术话语） |
+| `发布日期` | 优先 `publication_date`，缺失时用 `{publication_year}-01-01` |
+| `来源` | `journal`，缺失时用 `source_api` |
+| `原始URL` | `landing_page_url` |
+| `文件地址` | `fulltext/` 下的附件相对路径（优先 PDF，其次 XML/TXT）；没有对应附件时填 `None` |
+
+> **`*文件名` 的来源**：直接取学术元数据中的稳定 `id`，例如 OpenAlex 的 `W2606951880` 或 Crossref DOI。
+> 文章标题写入 `*标题`，真实附件位置由 `文件地址` 提供。
+
+> **大文件友好**：导出器优先逐行读取 `works.csv`，避免一次性加载大型 `works.json`；如果只有 `works.json`，也会按 JSON 数组增量解析。`fulltext/` 目录只扫描一次建立索引，10w+ 规模也能稳定导出。
 
 ### works.json 字段（20 个）
 
@@ -510,8 +559,8 @@ Crossref 的摘要为 **JATS XML 格式**（含 `<jats:p>`、`<jats:sec>` 等标
 
 ```
 poverty/
-├── collect_english.py        # 英文学术文献采集器
-├── README_academic.md        # 本文档
+├── academic_collector.py        # 英文学术文献采集器
+├── README_en.md        # 本文档
 └── data/
     └── processed/
         └── academic/
@@ -633,12 +682,63 @@ python report_collector.py --run-id <RUN_ID> --download --include-txt
 - **增量写回**：合并进原 run 的 works.json
 - **全文断点**：已下载的 PDF/TXT 不重复下载
 
+## 导出数据库导入 CSV（`report_export_csv.py`）
+
+报告采集完成后，用独立脚本导出数据库批量导入 CSV，字段对齐
+[数据库相关指南/批量上传使用指南.md](数据库相关指南/批量上传使用指南.md) 的 Excel 模板。
+
+```bash
+python report_export_csv.py                       # 自动导出最新 run
+python report_export_csv.py --run-id 20260909_233623
+python report_export_csv.py --all                 # 合并所有 run（按 handle 去重）
+python report_export_csv.py --run-id X --no-pdf-text   # 只用摘要，跳过 PDF 解析
+python report_export_csv.py --run-id X --desc-chars 2000   # 描述长度上限
+```
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--run-id` | 最新 run | 指定 `data/processed/report/{run_id}` |
+| `--all` | 关 | 合并目录下所有 run，按 `handle` 去重 |
+| `--out` | 该 run 目录 | 自定义 CSV 输出路径 |
+| `--desc-chars` | `1000` | `描述 / 内容` 字符上限 |
+| `--no-pdf-text` | 关 | 不解析 PDF 正文（仅用摘要，速度快） |
+
+### 字段映射
+
+| CSV 列 | 来源 |
+|--------|------|
+| `*文件名` | `works.json` / `works.csv` 中的原始 `handle`（如 `10665/62630`），不使用标题、不添加扩展名 |
+| `*标题` | `title` |
+| `描述 / 内容` | 摘要优先；摘要为空时从 PDF/TXT 正文提取前 `--desc-chars` 字 |
+| `*分类` | 固定 `reports` |
+| `*类型` | 固定 `text` |
+| `*国家` / `地区` | 标题或摘要命中 China 关键词 → `china` / `asia`；否则 `global` / 空 |
+| `关键词` | 标题+摘要命中的主题词（poverty / rural development / social protection 等） |
+| `发展阶段` | 仅中国资源按年份推断；全球报告留空 |
+| `*话语类型` | 固定 `institutional`（机构话语） |
+| `发布日期` | `{publication_year}-01-01`（报告库只到年） |
+| `来源` | 机构名（WHO / WorldBank / ...） |
+| `原始URL` | 报告页面链接 |
+| `文件地址` | `fulltext/` 下的附件相对路径（如 `fulltext/10665_62630.pdf`）；**没有对应 PDF/TXT 时填 `None`** |
+
+> **`*文件名` 的来源**：直接取报告元数据中的 `handle`（如 `10665/62630`）。
+> 报告标题写入 `*标题`，物理附件位置由 `文件地址` 提供。
+
+> **大文件友好**：`fulltext/` 目录只扫描一次建立索引，写 CSV 时逐条流式落盘，
+> 不把全部行堆在内存，10w+ 报告也能稳定导出；每 2000 条打印一次进度。
+
+> **描述为空的原因**：报告摘要为空（WHO 常见），且本机未装 PDF 解析库或 PDF 为扫描件。
+> 安装 `pypdf`（`pip install pypdf`，已加入 requirements.txt）后重跑即可补全正文描述。
+
 ## 输出
 
 ```
 data/processed/report/{run_id}/
 ├── works.json      # 报告元数据
 ├── works.csv
+├── db_import.csv   # 数据库导入索引（report_export_csv.py 生成）
 ├── summary.md
 └── fulltext/       # --download 下载的 PDF / TXT
     ├── 10665_62630.pdf

@@ -1,6 +1,6 @@
 # ============================================
 # 扶贫数据采集系统 - Python 依赖
-# 覆盖: main.py (新闻爬虫) + collect_english.py (英文学术文献采集)
+# 覆盖: main.py (新闻爬虫) + academic_collector.py (英文学术文献采集)
 # ============================================
 
 # HTTP 请求 (两个采集器共用)
@@ -17,6 +17,9 @@ python-dotenv>=1.0.0
 
 # 日期处理
 python-dateutil>=2.8.0
+
+# PDF 正文提取（report/academic 导出 CSV 时补全“描述/内容”）
+pypdf>=4.0.0
 
 # 数据处理（可选）
 # pandas>=2.0.0
