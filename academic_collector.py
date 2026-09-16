@@ -142,6 +142,7 @@ CROSSREF_OFFSET_LIMIT = 10000
 # 可填多个 key（每人各自额度），程序轮换使用，整体额度翻倍
 OPENALEX_API_KEYS = [
     "dke7UcbHWbmO6iYa9rfXOt",      # key 1（主）
+    "GdQak83gTOMNdUXboensIr"
     # "your-second-openalex-key",   # ⬅ 填入第二个 key，即可双倍额度
     # "your-third-openalex-key",
 ]
@@ -239,12 +240,17 @@ class OpenAlexSource:
         self.name = "openalex"
 
     def _next_api_key(self) -> str:
-        """轮换返回下一个 API key（多 key 分摊额度）"""
+        """返回当前 API key（一个用完后再切换下一个）"""
         if not self.api_keys:
             return ""
-        key = self.api_keys[self._key_idx % len(self.api_keys)]
-        self._key_idx += 1
-        return key
+        return self.api_keys[min(self._key_idx, len(self.api_keys) - 1)]
+
+    def _switch_api_key(self) -> bool:
+        """当前 key 额度用完 → 切下一个；还有剩余 key 返回 True"""
+        if self._key_idx < len(self.api_keys) - 1:
+            self._key_idx += 1
+            return True
+        return False
 
     def search(self, keyword: str, year_filter: str, has_abstract: bool,
                limit: Optional[int], china_specific: bool,
@@ -322,7 +328,6 @@ class OpenAlexSource:
           - 其他 4xx HTTP 错误 → 优雅返回 None（不重试，永久错误）
         """
         n_keys = max(1, len(self.api_keys))
-        budget_hits = 0
         for attempt in range(retries + n_keys):
             key = self._next_api_key()
             if key:
@@ -334,14 +339,13 @@ class OpenAlexSource:
                     # 区分：额度用完 vs 普通限流
                     if ("Insufficient budget" in resp.text
                             or "budget" in resp.text):
-                        # 该 key 额度用完 → 换下一个 key 继续
-                        budget_hits += 1
-                        if budget_hits >= n_keys:
-                            raise BudgetExhausted()  # 所有 key 用尽
-                        logger.warning(
-                            f"OpenAlex 某 key 额度用完，切换下一个 "
-                            f"({budget_hits}/{n_keys})")
-                        continue
+                        # 当前 key 额度用完 → 切换下一个 key 继续
+                        if self._switch_api_key():
+                            logger.warning(
+                                f"OpenAlex 某 key 额度用完，"
+                                f"切换到 key{self._key_idx + 1} 继续")
+                            continue
+                        raise BudgetExhausted()  # 所有 key 用尽
                     logger.warning(f"OpenAlex 限流(429)，等待 10s...")
                     time.sleep(10)
                     return None
@@ -697,12 +701,17 @@ class AcademicCollector:
         return [k for k in src.replace(",", " ").split() if k]
 
     def _next_api_key(self) -> str:
-        """轮换返回下一个 API key（多 key 分摊额度）"""
+        """返回当前 API key（一个用完后再切换下一个）"""
         if not self.api_keys:
             return ""
-        key = self.api_keys[self._key_idx % len(self.api_keys)]
-        self._key_idx += 1
-        return key
+        return self.api_keys[min(self._key_idx, len(self.api_keys) - 1)]
+
+    def _switch_api_key(self) -> bool:
+        """当前 key 额度用完 → 切下一个；还有剩余 key 返回 True"""
+        if self._key_idx < len(self.api_keys) - 1:
+            self._key_idx += 1
+            return True
+        return False
 
     def load_run(self) -> List[Dict]:
         """读取已有 run 的 works.json
@@ -1374,14 +1383,13 @@ class AcademicCollector:
 
     def _download_content_api(self, oa_id: str, fmt: str,
                               out_path: Path) -> str:
-        """从 content API 下载单个格式（多 key 轮换）
+        """从 content API 下载单个格式（一个 key 用完再切下一个）
 
-        单 key 额度用完 → 自动切下一个 key；所有 key 用尽才返回 budget。
+        当前 key 额度用完 → 切换下一个 key 继续；所有 key 用尽才返回 budget。
 
         Returns: ok / not_found / budget(所有 key 用尽) / fail
         """
         n_keys = max(1, len(self.api_keys))
-        budget_hits = 0
         for _ in range(n_keys):
             key = self._next_api_key()
             url = f"{CONTENT_BASE_URL}/{oa_id}.{fmt}?api_key={key}"
@@ -1402,12 +1410,13 @@ class AcademicCollector:
                 if resp.status_code == 429:
                     if ("Insufficient budget" in resp.text
                             or "budget" in resp.text):
-                        # 该 key 额度用完 → 换下一个 key 继续
-                        budget_hits += 1
-                        logger.warning(
-                            f"  某 key 额度用完，切换下一个 "
-                            f"({budget_hits}/{n_keys})")
-                        continue
+                        # 当前 key 额度用完 → 切下一个 key 继续
+                        if self._switch_api_key():
+                            logger.warning(
+                                f"  某 key 额度用完，切换到 "
+                                f"key{self._key_idx + 1} 继续")
+                            continue
+                        return "budget"  # 所有 key 用尽
                     time.sleep(10)  # 普通限流退避
                     return "fail"
                 if resp.status_code in (502, 503, 504):
