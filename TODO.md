@@ -75,18 +75,19 @@
 
 ### 采集方案（复用现有 Bing 爬虫）
 
-现有 `spiders/bing_news_spider.py` 已用于中文新闻，可扩展英文采集：
+英文新闻使用独立的 `english_news_collector.py`，避免与中文新闻的目录和字段互相覆盖：
 
-- [ ] 新增英文关键词集（见第三节），Bing 检索自动识别返回英文结果（`Accept-Language` 已设 en-US）
-- [ ] 新增英文媒体来源过滤（对齐 `OFFICIAL_MEDIA` 思路，建 `INTL_ENGLISH_MEDIA` 官方/非官方表）
-- [ ] 输出到独立目录 `data/processed/env_news/{run_id}/`，**不与中文 news 混放**
-- [ ] 媒体来源判定：英文媒体名/域名匹配（`source_filter` 复用）
+- [x] 新增英文关键词集，Bing 使用 `en-US` 检索
+- [x] 新增英文媒体来源过滤，支持官方媒体和国际媒体域名匹配
+- [x] 输出到独立目录 `data/processed/env_news/{run_id}/`，**不与中文 news 混放**
+- [x] 媒体来源判定：英文媒体名/域名匹配
 
 ### 子任务
 
-- [ ] 扩展 `bing_news_spider` 支持英文关键词 + 英文来源过滤（或新建 `english_news_spider.py`）
+- [x] 新建 `english_news_collector.py`，支持英文关键词和英文媒体过滤
 - [ ] 政策类文本补充：english.gov.cn 白皮书（结构化页面，单独抓）
-- [ ] 新闻正文下载 + LLM 清洗（复用 `--download` / `--clean` 流程，需支持指定英文语料目录）
+- [x] 新闻正文下载，支持增量跳过、失败日志和进度汇总
+- [x] 英文新闻 LLM 清洗与 CSV 导出（`english_news_cleaner.py`）
 
 ---
 
@@ -140,8 +141,8 @@
 |------|------|------|------|
 | 1 | 调研报告库 API（Discovery: 多数为 DSpace，WHO IRIS 实测可用） | 接口清单 + 可行性 | ✅ 完成 |
 | 2 | 报告采集器 ReportCollector | `data/processed/report/` 元数据 | ✅ 完成（`report_collector.py`） |
-| 3 | 扩展新闻爬虫（英文关键词 + 来源过滤） | `data/processed/env_news/` 元数据 | ⏳ 待做 |
-| 4 | 报告 PDF/TXT / 新闻正文下载 + 清洗 | `fulltext` / `.md` | ✅ 报告部分完成 |
+| 3 | 扩展新闻爬虫（英文关键词 + 来源过滤） | `data/processed/env_news/` 元数据 | ✅ 完成 |
+| 4 | 报告 PDF/TXT / 新闻正文下载 + 清洗 | `fulltext` / `.md` | ⏳ 新闻清洗待接入 |
 | 5 | 三语料合并 → 知识图谱/主题建模输入 | 统一 dataset | ⏳ 待做 |
 
 **里程碑**：
