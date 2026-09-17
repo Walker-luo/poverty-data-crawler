@@ -2,69 +2,6 @@
 
 采集**国外英文**关于中国贫困治理/精准扶贫/脱贫/乡村振兴的语料，输出结构化数据供**知识图谱**和**主题建模**使用。
 
-## 语料结构（三层）
-
-| 层 | 内容 | 脚本 | 数据目录 |
-|----|------|------|---------|
-| **① 学术文献** | OpenAlex / Crossref 论文（引用/概念/机构） | [academic_collector.py](academic_collector.py) + [academic_export_csv.py](academic_export_csv.py) | `data/processed/academic/` |
-| **② 官方组织报告** | WHO/World Bank 等 DSpace 报告库（含全文） | [report_collector.py](report_collector.py) + [report_export_csv.py](report_export_csv.py) | `data/processed/report/` |
-| **③ 国际新闻** | 国际英文媒体（Bing 新闻搜索） | [english_news_collector.py](english_news_collector.py) | `data/processed/env_news/` |
-
-三者统一 `source_type` 字段（`academic` / `report` / `news`），后续合并建图。
-
-## 三、国际英文新闻采集
-
-`english_news_collector.py` 独立于中文新闻流水线，采集关于中国贫困治理、减贫、脱贫、乡村振兴和共同富裕的英文新闻。默认结果保存到 `data/processed/env_news/{run_id}/`，包括 `news.json`、`news.csv`、`summary.md`、`fail.log` 和正文目录 `articles/{id}.md`。
-
-默认关键词覆盖 `China poverty`、`China poverty alleviation`、`China poverty reduction`、`targeted poverty alleviation China`、`China rural revitalization`、`China common prosperity` 等。内置媒体包括 CGTN、Xinhua English、People's Daily Online、China Daily、english.gov.cn，以及 Reuters、BBC、The Guardian、SCMP、The Diplomat、Sixth Tone、Caixin Global。
-
-### 基本命令
-
-```bash
-# 小批量采集，每个运行最多新增 5 条
-python english_news_collector.py --limit 5
-
-# 指定关键词、年份和翻页深度
-python english_news_collector.py --keywords "China rural revitalization" "China poverty" --years 2020 2021 2022 2023 2024 2025 2026 --pages 3
-
-# 只保留指定媒体
-python english_news_collector.py --sources Reuters BBC CGTN --limit 20
-
-# 采集后立即下载正文
-python english_news_collector.py --limit 10 --download
-
-# 对已有 run 继续采集和下载，已有 URL/Markdown 自动跳过
-python english_news_collector.py --run-id 20260916_120000 --limit 100 --download
-
-# 只对已有 run 下载正文，不重新访问 Bing
-python english_news_collector.py --run-id 20260916_120000 --download-only --limit 20
-
-# 对已下载正文进行英文 LLM 清洗，并生成数据库导入 CSV
-python english_news_cleaner.py --run-id 20260916_120000 --batch-size 5 --limit 20
-```
-
-`--limit` 表示本次新增采集或本次下载最多处理多少条。采集器按 URL 去重；正文下载检查 `articles/{id}.md`，中断后重复执行会继续处理未完成条目。失败会实时追加到 `fail.log`，终端显示进度，`summary.md` 保存最近一次汇总。
-
-采集每完成一页就写回 `news.json/news.csv`。下载每完成一篇就更新 `download_log.json`，记录 `success` 或 `failed` 及原因；因此程序中断后可以使用 `--download-only` 继续已有 run，不会重新检索新闻。
-
-| 参数 | 作用 |
-|------|------|
-| `--run-id` | 指定已有目录，执行增量采集或断点下载 |
-| `--keywords` | 自定义英文关键词，可传多个 |
-| `--sources` | 按媒体名称过滤，名称见脚本内 `MEDIA` |
-| `--years` | 指定检索年份，默认 2000 年至当前年份 |
-| `--pages` | 每个关键词/年份最多翻页数，默认 3 |
-| `--limit` | 限制本次新增采集或正文下载数量 |
-| `--download` | 下载新闻正文为 Markdown |
-| `--download-only` | 只读取指定 run 的 `news.json` 下载正文，不重新采集 |
-| `--delay` | 请求间隔，默认 1.5 秒 |
-
-### 英文新闻清洗
-
-`english_news_cleaner.py` 只处理 `articles/` 下已经下载的 Markdown，已存在且有效的 `articles/clean/{id}.md` 会跳过。默认每 5 篇调用一次 DeepSeek，失败批次写入同一 run 的 `fail.log`，清洗完成后生成 `db_import.csv`。需要设置 `DEEPSEEK_API_KEY`，或通过 `--api-key` 传入。
-
----
-
 # 一、英文学术文献采集器
 
 ## 项目目标
@@ -818,3 +755,68 @@ data/processed/report/{run_id}/
 - **SSL 抖动**（World Bank/IFAD 个别机构）→ 换网络/代理重试；服务器上复测
 - **下载不到全文** → 偶发 WHO 限流，重跑 `--run-id X --download` 自动续（已下载跳过）
 - **`normalize` KeyError**（`dc.creator` 结构差异）→ 已修复，兼容 dict/str/list 各种形态
+
+
+
+## 语料结构（三层）
+
+| 层                 | 内容                                       | 脚本                                                                                              | 数据目录                   |
+| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------------------------------- | -------------------------- |
+| **① 学术文献**     | OpenAlex / Crossref 论文（引用/概念/机构） | [academic_collector.py](academic_collector.py) + [academic_export_csv.py](academic_export_csv.py) | `data/processed/academic/` |
+| **② 官方组织报告** | WHO/World Bank 等 DSpace 报告库（含全文）  | [report_collector.py](report_collector.py) + [report_export_csv.py](report_export_csv.py)         | `data/processed/report/`   |
+| **③ 国际新闻**     | 国际英文媒体（Bing 新闻搜索）              | [english_news_collector.py](english_news_collector.py)                                            | `data/processed/news/en/` |
+
+三者统一 `source_type` 字段（`academic` / `report` / `news`），后续合并建图。
+
+## 三、国际英文新闻采集
+
+`english_news_collector.py` 独立于中文新闻流水线，采集关于中国贫困治理、减贫、脱贫、乡村振兴和共同富裕的英文新闻。默认结果保存到 `data/processed/news/en/{run_id}/`，包括 `news.json`、`news.csv`、`summary.md`、`fail.log` 和正文目录 `articles/{id}.md`。其中 `en` 与 `data/processed/news/{run_id}/` 的中文新闻目录分开。
+
+默认关键词覆盖 `China poverty`、`China poverty alleviation`、`China poverty reduction`、`targeted poverty alleviation China`、`China rural revitalization`、`China common prosperity` 等。内置媒体包括 CGTN、Xinhua English、People's Daily Online、China Daily、english.gov.cn，以及 Reuters、BBC、The Guardian、SCMP、The Diplomat、Sixth Tone、Caixin Global。
+
+### 基本命令
+
+```bash
+# 小批量采集，每个运行最多新增 5 条
+python english_news_collector.py --limit 5
+
+# 指定关键词、年份和翻页深度
+python english_news_collector.py --keywords "China rural revitalization" "China poverty" --years 2020 2021 2022 2023 2024 2025 2026 --pages 3
+
+# 只保留指定媒体
+python english_news_collector.py --sources Reuters BBC CGTN --limit 20
+
+# 采集后立即下载正文
+python english_news_collector.py --limit 10 --download
+
+# 对已有 run 继续采集和下载，已有 URL/Markdown 自动跳过
+python english_news_collector.py --run-id 20260916_120000 --limit 100 --download
+
+# 只对已有 run 下载正文，不重新访问 Bing
+python english_news_collector.py --run-id 20260916_120000 --download-only --limit 20
+
+# 对已下载正文进行英文 LLM 清洗，并生成数据库导入 CSV
+python english_news_cleaner.py --run-id 20260916_120000 --batch-size 5 --limit 20
+```
+
+`--limit` 表示本次新增采集或本次下载最多处理多少条。采集器按 URL 去重；正文下载检查 `articles/{id}.md`，中断后重复执行会继续处理未完成条目。失败会实时追加到 `fail.log`，终端显示进度，`summary.md` 保存最近一次汇总。指定旧 run ID 时，程序也会兼容读取此前的 `data/processed/env_news/{run_id}/` 目录。
+
+采集每完成一页就写回 `news.json/news.csv`。下载每完成一篇就更新 `download_log.json`，记录 `success` 或 `failed` 及原因；因此程序中断后可以使用 `--download-only` 继续已有 run，不会重新检索新闻。
+
+| 参数              | 作用                                               |
+| ----------------- | -------------------------------------------------- |
+| `--run-id`        | 指定已有目录，执行增量采集或断点下载               |
+| `--keywords`      | 自定义英文关键词，可传多个                         |
+| `--sources`       | 按媒体名称过滤，名称见脚本内 `MEDIA`               |
+| `--years`         | 指定检索年份，默认 2000 年至当前年份               |
+| `--pages`         | 每个关键词/年份最多翻页数，默认 3                  |
+| `--limit`         | 限制本次新增采集或正文下载数量                     |
+| `--download`      | 下载新闻正文为 Markdown                            |
+| `--download-only` | 只读取指定 run 的 `news.json` 下载正文，不重新采集 |
+| `--delay`         | 请求间隔，默认 1.5 秒                              |
+
+### 英文新闻清洗
+
+`english_news_cleaner.py` 只处理 `articles/` 下已经下载的 Markdown，已存在且有效的 `articles/clean/{id}.md` 会跳过。默认每 5 篇调用一次 DeepSeek，失败批次写入同一 run 的 `fail.log`，清洗完成后生成 `db_import.csv`。需要设置 `DEEPSEEK_API_KEY`，或通过 `--api-key` 传入。
+
+---

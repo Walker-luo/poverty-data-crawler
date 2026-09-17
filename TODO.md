@@ -79,7 +79,7 @@
 
 - [x] 新增英文关键词集，Bing 使用 `en-US` 检索
 - [x] 新增英文媒体来源过滤，支持官方媒体和国际媒体域名匹配
-- [x] 输出到独立目录 `data/processed/env_news/{run_id}/`，**不与中文 news 混放**
+- [x] 输出到 `data/processed/news/en/{run_id}/`，通过 `en` 子目录与中文 news 分开
 - [x] 媒体来源判定：英文媒体名/域名匹配
 
 ### 子任务
@@ -141,7 +141,7 @@
 |------|------|------|------|
 | 1 | 调研报告库 API（Discovery: 多数为 DSpace，WHO IRIS 实测可用） | 接口清单 + 可行性 | ✅ 完成 |
 | 2 | 报告采集器 ReportCollector | `data/processed/report/` 元数据 | ✅ 完成（`report_collector.py`） |
-| 3 | 扩展新闻爬虫（英文关键词 + 来源过滤） | `data/processed/env_news/` 元数据 | ✅ 完成 |
+| 3 | 扩展新闻爬虫（英文关键词 + 来源过滤） | `data/processed/news/en/` 元数据 | ✅ 完成 |
 | 4 | 报告 PDF/TXT / 新闻正文下载 + 清洗 | `fulltext` / `.md` | ⏳ 新闻清洗待接入 |
 | 5 | 三语料合并 → 知识图谱/主题建模输入 | 统一 dataset | ⏳ 待做 |
 

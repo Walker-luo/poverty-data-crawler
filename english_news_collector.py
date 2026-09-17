@@ -7,7 +7,7 @@ Examples:
     python english_news_collector.py --run-id 20260916_120000 --download --limit 20
 
 The collector is intentionally independent from the Chinese news pipeline. It
-stores data under data/processed/env_news/{run_id}/.
+stores data under data/processed/news/en/{run_id}/.
 """
 
 import argparse
@@ -27,7 +27,11 @@ from bs4 import BeautifulSoup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("english_news")
 
-BASE_DIR = Path("data/processed/env_news")
+# English news is kept in a separate subdirectory so it can live alongside
+# Chinese news under data/processed/news without mixing the two datasets.
+BASE_DIR = Path("data/processed/news/en")
+# Backward compatibility for runs created before the directory was moved.
+LEGACY_BASE_DIR = Path("data/processed/env_news")
 KEYWORDS = [
     "China poverty", "China poverty alleviation", "China poverty reduction",
     "China poverty eradication", "targeted poverty alleviation China",
@@ -90,9 +94,9 @@ class EnglishNewsCollector:
     BASE_URL = "https://www.bing.com/news/search"
 
     def __init__(self, run_id: Optional[str] = None, delay: float = 1.5,
-                 timeout: int = 20):
+        timeout: int = 20):
         self.run_id = run_id or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.data_dir = BASE_DIR / self.run_id
+        self.data_dir = self._resolve_data_dir(self.run_id)
         self.articles_dir = self.data_dir / "articles"
         self.fail_log = self.data_dir / "fail.log"
         self.delay = delay
@@ -105,6 +109,20 @@ class EnglishNewsCollector:
         })
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.articles_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _resolve_data_dir(run_id: str) -> Path:
+        """Resolve a run directory, preferring the new English-news path.
+
+        A supplied run ID that only exists in the old ``env_news`` location is
+        kept there so existing runs can still be downloaded or resumed.
+        """
+        new_dir = BASE_DIR / run_id
+        legacy_dir = LEGACY_BASE_DIR / run_id
+        if not new_dir.exists() and legacy_dir.exists():
+            logger.warning("检测到旧英文新闻目录，继续使用: %s", legacy_dir)
+            return legacy_dir
+        return new_dir
 
     def collect(self, keywords: List[str], years: List[int], pages: int,
                 limit: Optional[int] = None, sources: Optional[List[str]] = None) -> List[Dict]:

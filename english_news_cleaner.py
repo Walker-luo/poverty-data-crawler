@@ -11,7 +11,8 @@ from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("english_news_cleaner")
-ROOT = Path("data/processed/env_news")
+ROOT = Path("data/processed/news/en")
+LEGACY_ROOT = Path("data/processed/env_news")
 MODEL = "deepseek-chat"
 DEEPSEEK_API_KEY = ""
 SYSTEM = "Clean each English news article. Return only YAML frontmatter with title, summary, keywords, followed by the cleaned body. Use --- as the frontmatter delimiter. Preserve facts and remove ads/navigation."
@@ -28,6 +29,11 @@ def main():
     if not key:
         p.error("请填写 --api-key、DEEPSEEK_API_KEY 或脚本顶部 DEEPSEEK_API_KEY")
     run = ROOT / args.run_id
+    # 兼容目录调整前已经采集的英文新闻 run。
+    legacy_run = LEGACY_ROOT / args.run_id
+    if not run.exists() and legacy_run.exists():
+        logger.warning("检测到旧英文新闻目录，继续使用: %s", legacy_run)
+        run = legacy_run
     articles, clean = run / "articles", run / "articles" / "clean"
     csv_path = run / "news.csv"
     if not csv_path.exists():
