@@ -519,6 +519,9 @@ data/processed/academic/{run_id}/
 
 ## 导出数据库导入 CSV（`academic_export_csv.py`）
 
+数据库导入所需的字段、附件关联规则和论文/报告 CSV 的统一格式，见：
+[国外语料 CSV 导入简要说明](data/processed/csv_import_brief.md)。
+
 学术文献采集完成后，用独立脚本导出数据库批量导入 CSV。这个步骤**只读取本地 `works.csv/json` 和 `fulltext/` 文件**，不重新爬取，也不调用 OpenAlex / Crossref API，因此不会消耗额度。
 
 ```bash

@@ -13,6 +13,7 @@ data/raw/**/*
 data/processed/**/*
 !data/raw/**/.gitkeep
 !data/processed/**/.gitkeep
+!data/processed/csv_import_brief.md
 
 # 日志
 logs/*
