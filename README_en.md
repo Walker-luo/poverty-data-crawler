@@ -797,11 +797,21 @@ python english_news_collector.py --run-id 20260916_120000 --download-only --limi
 
 # 对已下载正文进行英文 LLM 清洗，并生成数据库导入 CSV
 python english_news_cleaner.py --run-id 20260916_120000 --batch-size 5 --limit 20
+
+# 服务器排查：只测试 Bing 新闻搜索，不正式采集
+python english_news_collector.py --check-search
+python english_news_collector.py --inspect-search
+python english_news_collector.py --check-search --bing-host cn
+python english_news_collector.py --inspect-search --bing-host cn --timeout 45
 ```
 
 `--limit` 表示本次新增采集或本次下载最多处理多少条。采集器按 URL 去重；正文下载检查 `articles/{id}.md`，中断后重复执行会继续处理未完成条目。失败会实时追加到 `fail.log`，终端显示进度，`summary.md` 保存最近一次汇总。指定旧 run ID 时，程序也会兼容读取此前的 `data/processed/env_news/{run_id}/` 目录。
 
 采集每完成一页就写回 `news.json/news.csv`。下载每完成一篇就更新 `download_log.json`，记录 `success` 或 `failed` 及原因；因此程序中断后可以使用 `--download-only` 继续已有 run，不会重新检索新闻。
+
+如果本机能采集、服务器 0 条，优先执行 `--check-search`。脚本会请求固定测试词 `China poverty 2024`，并把异常页面保存到 `data/processed/news/en/{run_id}/debug/`，同时在 `fail.log` 写明是请求失败、验证码/反爬、被重定向到首页、正常无结果，还是 Bing HTML 结构变化。`--download` 会先搜索再下载；如果服务器搜索阶段就是 0 条，后续自然不会下载正文。
+
+需要更详细排查时用 `--inspect-search`，它会分别打印 `www.bing.com` / `cn.bing.com` 的 HTTP 状态码、最终 URL、页面标题、响应长度和解析到的新闻数量。可以配合 `--debug-query` 改测试词。
 
 | 参数              | 作用                                               |
 | ----------------- | -------------------------------------------------- |
@@ -814,6 +824,36 @@ python english_news_cleaner.py --run-id 20260916_120000 --batch-size 5 --limit 2
 | `--download`      | 下载新闻正文为 Markdown                            |
 | `--download-only` | 只读取指定 run 的 `news.json` 下载正文，不重新采集 |
 | `--delay`         | 请求间隔，默认 1.5 秒                              |
+| `--timeout`       | 请求超时时间，默认 20 秒；服务器代理慢可调到 45-60 秒 |
+| `--bing-host`     | Bing 域名策略：`auto` 先试 `www` 再试 `cn`；服务器异常时可指定 `cn` |
+| `--check-search`  | 只做 Bing 新闻搜索预检，保存诊断，不采集数据       |
+| `--inspect-search`| 输出状态码/最终 URL/标题/解析数量，排查服务器 0 条 |
+| `--debug-query`   | 指定预检查询词，默认 `China poverty 2024`          |
+
+### 服务器 0 条排查
+
+```bash
+# 1. 先看服务器是否能访问并解析 Bing 新闻结果
+python english_news_collector.py --check-search
+
+# 1.1 更详细诊断：分别查看 www/cn 的状态码、最终 URL、标题、解析数量
+python english_news_collector.py --inspect-search
+python english_news_collector.py --inspect-search --debug-query "China rural revitalization 2024"
+
+# 2. 如果 www.bing.com 异常，指定 cn.bing.com 再测
+python english_news_collector.py --check-search --bing-host cn
+python english_news_collector.py --inspect-search --bing-host cn --timeout 45
+
+# 3. cn 可用后正式采集
+python english_news_collector.py --pages 10 --delay 2 --download --bing-host cn --timeout 45
+```
+
+查看输出目录中的 `fail.log` 和 `debug/*.html`：
+
+- `疑似验证码/反爬/访问被拦截`：服务器出口 IP 或代理被 Bing 拦截，换代理/出口 IP，或加大 `--delay`
+- `被重定向到非 news/search 页面`：服务器访问 Bing 被地区页/首页接管，尝试 `--bing-host cn`
+- `响应过短`：代理或网关返回错误页，检查 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量
+- `未发现新闻卡片或外部新闻链接`：Bing 返回的 HTML 结构和本机不同，把 `debug/*.html` 用浏览器打开即可定位
 
 ### 英文新闻清洗
 

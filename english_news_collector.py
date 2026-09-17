@@ -11,15 +11,17 @@ stores data under data/processed/news/en/{run_id}/.
 """
 
 import argparse
+import base64
 import csv
 import datetime as dt
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -91,24 +93,48 @@ def parse_date(url: str, text: str = "") -> str:
 
 
 class EnglishNewsCollector:
-    BASE_URL = "https://www.bing.com/news/search"
+    BASE_URLS = {
+        "www": "https://www.bing.com/news/search",
+        "cn": "https://cn.bing.com/news/search",
+    }
 
     def __init__(self, run_id: Optional[str] = None, delay: float = 1.5,
-        timeout: int = 20):
+        timeout: int = 20, bing_host: str = "auto"):
         self.run_id = run_id or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.data_dir = self._resolve_data_dir(self.run_id)
         self.articles_dir = self.data_dir / "articles"
+        self.debug_dir = self.data_dir / "debug"
         self.fail_log = self.data_dir / "fail.log"
         self.delay = delay
         self.timeout = timeout
+        self.bing_host = bing_host
+        self.debug_saved = 0
+        self.debug_limit = 20
+        self.search_stats = {
+            "requests": 0,
+            "failures": 0,
+            "abnormal_empty": 0,
+            "debug_pages": 0,
+            "last_reason": "",
+        }
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                           "AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
         })
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.articles_dir.mkdir(parents=True, exist_ok=True)
+
+    def _search_urls(self) -> List[str]:
+        if self.bing_host == "www":
+            return [self.BASE_URLS["www"]]
+        if self.bing_host == "cn":
+            return [self.BASE_URLS["cn"]]
+        return [self.BASE_URLS["www"], self.BASE_URLS["cn"]]
 
     @staticmethod
     def _resolve_data_dir(run_id: str) -> Path:
@@ -135,6 +161,12 @@ class EnglishNewsCollector:
                 domains.extend(MEDIA.get(source, [source]))
         total = len(keywords) * len(years)
         done = 0
+        if not self.check_search(write_summary=False):
+            logger.error("Bing 预检失败，已停止采集。请查看 %s 和 %s/ 下的 HTML 诊断页。",
+                         self.fail_log, self.debug_dir)
+            self._write_summary(len(output), 0, 0, 0)
+            return output
+
         logger.info("英文新闻采集: %s 个关键词 × %s 年 × %s 页 | 已有 %s 条",
                     len(keywords), len(years), pages, len(existing))
         for year in sorted(years, reverse=True):
@@ -171,28 +203,127 @@ class EnglishNewsCollector:
 
     def _fetch(self, query: str, page: int) -> List[Dict]:
         time.sleep(self.delay)
-        try:
-            response = self.session.get(self.BASE_URL, params={
-                "q": query, "first": page * 10 + 1, "setmkt": "en-US", "ensearch": "1",
-            }, timeout=self.timeout)
-            response.raise_for_status()
-            return self._parse(response.text)
-        except requests.RequestException as exc:
-            self._log_fail("search", query, "", str(exc))
-            logger.warning("搜索失败 [%s]: %s", query, type(exc).__name__)
-            return []
+        errors = []
+        for search_url in self._search_urls():
+            try:
+                self.search_stats["requests"] += 1
+                response = self.session.get(search_url, params={
+                    "q": query,
+                    "first": page * 10 + 1,
+                    "setmkt": "en-US",
+                    "mkt": "en-US",
+                    "setlang": "en-US",
+                    "cc": "US",
+                    "ensearch": "1",
+                }, timeout=self.timeout)
+                response.raise_for_status()
+                results = self._parse(response.text)
+                if results:
+                    return results
+
+                diag = self._diagnose_empty_response(response.text, response.url)
+                if diag["kind"] == "normal_empty":
+                    if query == "China poverty 2024":
+                        self._save_debug_page(query, page, response.text, "preflight_normal_empty")
+                    return []
+
+                self.search_stats["abnormal_empty"] += 1
+                self.search_stats["last_reason"] = diag["reason"]
+                debug_path = self._save_debug_page(query, page, response.text, diag["reason"])
+                reason = (f"{diag['reason']} | status={response.status_code} | "
+                          f"len={diag['length']} | title={diag['title'][:80]}")
+                if debug_path:
+                    reason += f" | debug={debug_path}"
+                errors.append(f"{urlparse(search_url).netloc}: {reason}")
+                logger.warning("Bing 返回异常空页 [%s p%s] via %s: %s",
+                               query, page, urlparse(search_url).netloc, diag["reason"])
+            except requests.RequestException as exc:
+                reason = f"{type(exc).__name__}: {str(exc)[:220]}"
+                errors.append(f"{urlparse(search_url).netloc}: {reason}")
+                self.search_stats["last_reason"] = reason
+                logger.warning("搜索失败 [%s] via %s: %s",
+                               query, urlparse(search_url).netloc, type(exc).__name__)
+
+        self.search_stats["failures"] += 1
+        self._log_fail("search", f"{query} page={page}", " | ".join(self._search_urls()),
+                       " ; ".join(errors) if errors else "unknown search error")
+        return []
+
+    def inspect_search(self, query: str = "China poverty 2024", page: int = 0) -> bool:
+        """Print one-request diagnostics for each Bing host without collecting data."""
+        proxy_vars = [name for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY") if os.environ.get(name)]
+        if proxy_vars:
+            logger.info("检测到代理环境变量: %s（未打印具体地址）", ", ".join(proxy_vars))
+
+        ok = False
+        for search_url in self._search_urls():
+            host = urlparse(search_url).netloc
+            try:
+                response = self.session.get(search_url, params={
+                    "q": query,
+                    "first": page * 10 + 1,
+                    "setmkt": "en-US",
+                    "mkt": "en-US",
+                    "setlang": "en-US",
+                    "cc": "US",
+                    "ensearch": "1",
+                }, timeout=self.timeout)
+                results = self._parse(response.text)
+                diag = self._diagnose_empty_response(response.text, response.url)
+                debug_path = ""
+                if not results:
+                    debug_path = self._save_debug_page(query, page, response.text, diag["reason"])
+                logger.info(
+                    "Bing诊断 host=%s | status=%s | results=%s | len=%s | final_url=%s | title=%s%s",
+                    host,
+                    response.status_code,
+                    len(results),
+                    diag["length"],
+                    response.url[:160],
+                    diag["title"][:100] or "None",
+                    f" | debug={debug_path}" if debug_path else "",
+                )
+                if response.ok and results:
+                    ok = True
+                elif not response.ok:
+                    self._log_fail("inspect", query, response.url, f"HTTP {response.status_code}")
+                else:
+                    self._log_fail("inspect", query, response.url, diag["reason"])
+            except requests.RequestException as exc:
+                reason = f"{type(exc).__name__}: {str(exc)[:220]}"
+                logger.warning("Bing诊断 host=%s | 请求失败: %s", host, reason)
+                self._log_fail("inspect", query, search_url, reason)
+        self._write_summary(len(self._load_json()), 0, 0, 0)
+        return ok
+
+    def check_search(self, query: str = "China poverty 2024", write_summary: bool = True) -> bool:
+        """Run one known Bing News query so server-side network problems are visible."""
+        proxy_vars = [name for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY") if os.environ.get(name)]
+        if proxy_vars:
+            logger.info("检测到代理环境变量: %s（未打印具体地址）", ", ".join(proxy_vars))
+        before_failures = self.search_stats["failures"]
+        before_abnormal = self.search_stats["abnormal_empty"]
+        results = self._fetch(query, 0)
+        ok = bool(results)
+        if ok:
+            logger.info("Bing 预检通过: '%s' 解析到 %s 条新闻", query, len(results))
+        else:
+            reason = self.search_stats.get("last_reason") or "解析结果为空"
+            logger.error("Bing 预检未解析到新闻: %s", reason)
+            if self.search_stats["failures"] == before_failures and self.search_stats["abnormal_empty"] == before_abnormal:
+                self._log_fail("preflight", query, "", "known query returned 0 results")
+        if write_summary:
+            self._write_summary(len(self._load_json()), 0, 0, 0)
+        return ok
 
     def _parse(self, html: str) -> List[Dict]:
         soup = BeautifulSoup(html, "lxml")
-        cards = soup.select("[class*=news-card], article")
+        cards = soup.select("[class*=news-card], [class*=newsitem], [class*=cardcommon], article")
         results = []
         for card in cards:
-            link = next((a for a in card.select("a[href]")
-                         if a.get("href", "").startswith("http")
-                         and "bing.com" not in a.get("href", "")), None)
-            if not link:
+            link, url = self._extract_news_link(card)
+            if not link or not url:
                 continue
-            url = link["href"]
             title = re.sub(r"\s+", " ", link.get_text(" ", strip=True))
             if len(title) < 8:
                 continue
@@ -208,7 +339,121 @@ class EnglishNewsCollector:
                     "CGTN", "Xinhua English", "People's Daily Online", "China Daily", "english.gov.cn"
                 }, "source_type": "news", "search_keyword": "",
             })
+
+        if not results:
+            results = self._parse_global_links(soup)
         return results
+
+    def _extract_news_link(self, card) -> Tuple[Optional[object], str]:
+        for link in card.select("a[href]"):
+            url = self._normalize_bing_href(link.get("href", ""))
+            if url:
+                return link, url
+        return None, ""
+
+    def _parse_global_links(self, soup: BeautifulSoup) -> List[Dict]:
+        """Fallback for simplified Bing pages where card classes differ."""
+        results: List[Dict] = []
+        seen: Set[str] = set()
+        for link in soup.select("a[href]"):
+            url = self._normalize_bing_href(link.get("href", ""))
+            title = re.sub(r"\s+", " ", link.get_text(" ", strip=True))
+            if not url or url in seen or len(title) < 12 or self._is_non_news_url(url):
+                continue
+            seen.add(url)
+            parent_text = re.sub(r"\s+", " ", link.parent.get_text(" ", strip=True)) if link.parent else title
+            source = source_from_url(url)
+            results.append({
+                "id": self._id(url), "title": title[:500], "url": url,
+                "source": source, "date": "", "pub_date": parse_date(url, parent_text),
+                "summary": parent_text[:500], "is_official": source in {
+                    "CGTN", "Xinhua English", "People's Daily Online", "China Daily", "english.gov.cn"
+                }, "source_type": "news", "search_keyword": "",
+            })
+            if len(results) >= 10:
+                break
+        return results
+
+    @staticmethod
+    def _is_non_news_url(url: str) -> bool:
+        host = urlparse(url).netloc.lower()
+        blocked_hosts = (
+            "microsoft.com", "go.microsoft.com", "support.microsoft.com",
+            "privacy.microsoft.com", "login.live.com", "account.microsoft.com",
+            "office.com", "aka.ms",
+        )
+        return any(host == item or host.endswith("." + item) for item in blocked_hosts)
+
+    def _normalize_bing_href(self, href: str) -> str:
+        if not href:
+            return ""
+        href = urljoin("https://www.bing.com", href)
+        parsed = urlparse(href)
+        host = parsed.netloc.lower()
+        if host and "bing.com" not in host:
+            return href
+        query = parse_qs(parsed.query)
+        for key in ("u", "url", "r"):
+            for raw in query.get(key, []):
+                decoded = self._decode_bing_url(raw)
+                if decoded and "bing.com" not in urlparse(decoded).netloc.lower():
+                    return decoded
+        return ""
+
+    @staticmethod
+    def _decode_bing_url(raw: str) -> str:
+        raw = unquote(raw or "")
+        if raw.startswith("http"):
+            return raw
+        if raw.startswith("a1"):
+            payload = raw[2:]
+            padding = "=" * (-len(payload) % 4)
+            try:
+                decoded = base64.urlsafe_b64decode((payload + padding).encode("ascii")).decode("utf-8", "ignore")
+                if decoded.startswith("http"):
+                    return decoded
+            except Exception:
+                return ""
+        return ""
+
+    def _diagnose_empty_response(self, html: str, final_url: str) -> Dict[str, str]:
+        soup = BeautifulSoup(html or "", "lxml")
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).lower()
+        final = final_url.lower()
+        length = len(html or "")
+        if any(marker in text for marker in [
+            "verify you are human", "captcha", "unusual traffic", "our services aren't available right now",
+            "access denied", "robot", "blocked",
+        ]):
+            kind, reason = "blocked", "疑似验证码/反爬/访问被拦截"
+        elif "/news/search" not in final:
+            kind, reason = "redirect", f"被重定向到非 news/search 页面: {final_url[:120]}"
+        elif any(marker in text for marker in [
+            "we didn't find any results", "there are no results", "no results for", "try different keywords",
+        ]):
+            kind, reason = "normal_empty", "Bing 正常返回无结果"
+        elif length < 2000:
+            kind, reason = "short", f"响应过短({length} bytes)，可能是代理/网关错误页"
+        else:
+            news_card_count = len(soup.select("[class*=news-card], [class*=newsitem], [class*=cardcommon], article"))
+            ext_links = sum(1 for a in soup.select("a[href]") if self._normalize_bing_href(a.get("href", "")))
+            if news_card_count == 0 and ext_links == 0:
+                kind, reason = "parser_miss", "未发现新闻卡片或外部新闻链接，可能是 Bing 页面结构/地区页不同"
+            else:
+                kind, reason = "parser_miss", f"发现卡片{news_card_count}个/外链{ext_links}个，但未能解析出有效新闻"
+        return {"kind": kind, "reason": reason, "title": title, "length": str(length), "final_url": final_url}
+
+    def _save_debug_page(self, query: str, page: int, html: str, reason: str) -> str:
+        if self.debug_saved >= self.debug_limit:
+            return ""
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", query).strip("_")[:80] or "query"
+        path = self.debug_dir / f"search_{slug}_p{page}_{self.debug_saved + 1}.html"
+        path.write_text(html or "", encoding="utf-8", errors="ignore")
+        self.debug_saved += 1
+        self.search_stats["debug_pages"] = self.debug_saved
+        return str(path)
 
     @staticmethod
     def _id(url: str) -> str:
@@ -290,7 +535,12 @@ class EnglishNewsCollector:
         (self.data_dir / "summary.md").write_text(
             f"# English news run {self.run_id}\n\n"
             f"- Records: {total}\n- Download success: {success}\n"
-            f"- Download failed: {failed}\n- Existing/skipped: {skipped}\n",
+            f"- Download failed: {failed}\n- Existing/skipped: {skipped}\n"
+            f"- Search requests: {self.search_stats['requests']}\n"
+            f"- Search failures: {self.search_stats['failures']}\n"
+            f"- Abnormal empty pages: {self.search_stats['abnormal_empty']}\n"
+            f"- Debug pages saved: {self.search_stats['debug_pages']}\n"
+            f"- Last search reason: {self.search_stats['last_reason'] or 'None'}\n",
             encoding="utf-8")
 
     def _log_fail(self, step: str, item: str, url: str, reason: str) -> None:
@@ -309,8 +559,25 @@ def main() -> None:
     parser.add_argument("--download", action="store_true", help="下载新闻正文")
     parser.add_argument("--download-only", action="store_true", help="只下载已有 run，不重新搜索")
     parser.add_argument("--delay", type=float, default=1.5)
+    parser.add_argument("--timeout", type=int, default=20, help="请求超时时间（秒），服务器代理较慢时可调大")
+    parser.add_argument("--bing-host", choices=["auto", "www", "cn"], default="auto",
+                        help="Bing 域名策略：auto 先试 www 再试 cn；服务器访问异常时可指定 cn")
+    parser.add_argument("--check-search", action="store_true",
+                        help="只做 Bing 新闻搜索预检并保存诊断，不采集数据")
+    parser.add_argument("--inspect-search", action="store_true",
+                        help="输出每个 Bing 域名的状态码/最终URL/标题/解析数量，用于服务器诊断")
+    parser.add_argument("--debug-query", default="China poverty 2024",
+                        help="配合 --check-search/--inspect-search 使用的测试查询")
     args = parser.parse_args()
-    collector = EnglishNewsCollector(args.run_id, args.delay)
+    collector = EnglishNewsCollector(args.run_id, args.delay, timeout=args.timeout, bing_host=args.bing_host)
+    if args.inspect_search:
+        ok = collector.inspect_search(args.debug_query)
+        logger.info("搜索诊断完成: %s | run=%s | 目录=%s", "可解析" if ok else "不可解析", collector.run_id, collector.data_dir)
+        raise SystemExit(0 if ok else 2)
+    if args.check_search:
+        ok = collector.check_search(query=args.debug_query)
+        logger.info("搜索预检完成: %s | run=%s | 目录=%s", "通过" if ok else "失败", collector.run_id, collector.data_dir)
+        raise SystemExit(0 if ok else 2)
     if args.download_only:
         articles = collector._load_json()
         if not articles:
