@@ -15,11 +15,11 @@ ROOT = Path("data/processed/news/en")
 LEGACY_ROOT = Path("data/processed/env_news")
 MODEL = "deepseek-chat"
 DEEPSEEK_API_KEY = ""
-SYSTEM = "Clean each English news article. Return only YAML frontmatter with title, summary, keywords, followed by the cleaned body. Use --- as the frontmatter delimiter. Preserve facts and remove ads/navigation."
+SYSTEM = "Clean each news article in its original language. Return only YAML frontmatter with title, summary, keywords, followed by the cleaned body. Use --- as the frontmatter delimiter. Preserve facts, remove ads/navigation, and do not translate unless necessary for a short metadata field."
 
 
 def main():
-    p = argparse.ArgumentParser(description="英文新闻 LLM 清洗")
+    p = argparse.ArgumentParser(description="多语种新闻 LLM 清洗")
     p.add_argument("--run-id", required=True)
     p.add_argument("--limit", type=int)
     p.add_argument("--batch-size", type=int, default=5)
@@ -55,7 +55,11 @@ def main():
         batch = pending[start:start + max(1, args.batch_size)]
         inputs = []
         for n, row in enumerate(batch, 1):
-            inputs.append(f"ARTICLE {n}\nTITLE: {row['title']}\nSOURCE: {row['source']}\nDATE: {row['pub_date']}\n\n{row['_text'][:20000]}")
+            inputs.append(
+                f"ARTICLE {n}\nTITLE: {row['title']}\nSOURCE: {row['source']}\n"
+                f"DATE: {row['pub_date']}\nLANGUAGE: {row.get('language', 'en')}\n"
+                f"COUNTRY_FOCUS: {row.get('country_focus', '')}\n\n{row['_text'][:20000]}"
+            )
         try:
             response = client.chat.completions.create(model=MODEL, messages=[
                 {"role": "system", "content": SYSTEM},
@@ -88,7 +92,9 @@ def generate_csv(run, rows, clean):
                 continue
             text = path.read_text(encoding="utf-8", errors="ignore")
             match = re.search(r"^summary:\s*[\"']?(.*?)[\"']?\s*$", text, re.M)
-            writer.writerow({"*文件名": row["id"], "*标题": row["title"], "描述 / 内容": match.group(1).strip() if match else row.get("summary", ""), "*分类": "news", "*类型": "text", "*国家": "global", "地区": "", "关键词": row.get("search_keyword", ""), "发展阶段": "", "*话语类型": "institutional" if str(row.get("is_official")).lower() == "true" else "civilian", "发布日期": row.get("pub_date", ""), "来源": row.get("source", ""), "原始URL": row.get("url", ""), "文件地址": f"articles/clean/{row['id']}.md"})
+            country_focus = row.get("country_focus", "")
+            country = "china" if country_focus.lower() == "china" else "global"
+            writer.writerow({"*文件名": row["id"], "*标题": row["title"], "描述 / 内容": match.group(1).strip() if match else row.get("summary", ""), "*分类": "news", "*类型": "text", "*国家": country, "地区": country_focus, "关键词": row.get("search_keyword", ""), "发展阶段": "", "*话语类型": "institutional" if str(row.get("is_official")).lower() == "true" else "civilian", "发布日期": row.get("pub_date", ""), "来源": row.get("source", ""), "原始URL": row.get("url", ""), "文件地址": f"articles/clean/{row['id']}.md"})
             count += 1
     logger.info("数据库 CSV 已生成: %s (%s 条)", run / "db_import.csv", count)
 

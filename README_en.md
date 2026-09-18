@@ -780,6 +780,15 @@ data/processed/report/{run_id}/
 # 小批量采集，每个运行最多新增 5 条
 python english_news_collector.py --limit 5
 
+# 全球多语种小批量测试
+python english_news_collector.py --scope global --languages en es fr --years 2024 2025 2026 --pages 1 --limit 30
+
+# 全球多语种 + 指定国家
+python english_news_collector.py --scope global --languages en es fr pt --countries India Brazil South_Africa --years 2020 2021 2022 2023 2024 2025 2026 --pages 3
+
+# 中国与全球语料合并采集
+python english_news_collector.py --scope all --languages en zh es fr pt --countries India Brazil South_Africa --years 2020 2021 2022 2023 2024 2025 2026 --pages 3
+
 # 指定关键词、年份和翻页深度
 python english_news_collector.py --keywords "China rural revitalization" "China poverty" --years 2020 2021 2022 2023 2024 2025 2026 --pages 10
 
@@ -803,9 +812,14 @@ python english_news_collector.py --check-search
 python english_news_collector.py --inspect-search
 python english_news_collector.py --check-search --bing-host cn
 python english_news_collector.py --inspect-search --bing-host cn --timeout 45
+python english_news_collector.py --inspect-search --use-proxy --timeout 45
 ```
 
 `--limit` 表示本次新增采集或本次下载最多处理多少条。采集器按 URL 去重；正文下载检查 `articles/{id}.md`，中断后重复执行会继续处理未完成条目。失败会实时追加到 `fail.log`，终端显示进度，`summary.md` 保存最近一次汇总。指定旧 run ID 时，程序也会兼容读取此前的 `data/processed/env_news/{run_id}/` 目录。
+
+默认 `--scope china` 保持原有中国英文语料逻辑。需要扩大到全球扶贫治理时使用 `--scope global`；需要中国与全球一起采集使用 `--scope all`。`--languages` 支持英语 `en`、西班牙语 `es`、法语 `fr`、葡萄牙语 `pt`、阿拉伯语 `ar`、印地语 `hi`、印尼语 `id`、越南语 `vi` 和中文 `zh`。`--countries` 会把国家名追加到全球关键词后，例如 `poverty reduction India`，不指定时只使用全球通用关键词，避免请求数量失控。
+
+新采集的 `news.csv/news.json` 会额外记录：`language`（查询语言）、`country_focus`（国家限定词，全球通用查询为空）和 `scope`（`china` / `global`）。清洗器会把这些信息传给大模型，生成 `db_import.csv` 时中国资源标记为 `china`，指定国家写入“地区”，其他全球资源标记为 `global`。
 
 采集每完成一页就写回 `news.json/news.csv`。下载每完成一篇就更新 `download_log.json`，记录 `success` 或 `failed` 及原因；因此程序中断后可以使用 `--download-only` 继续已有 run，不会重新检索新闻。
 
@@ -820,7 +834,10 @@ python english_news_collector.py --inspect-search --bing-host cn --timeout 45
 | 参数              | 作用                                               |
 | ----------------- | -------------------------------------------------- |
 | `--run-id`        | 指定已有目录，执行增量采集或断点下载               |
-| `--keywords`      | 自定义英文关键词，可传多个                         |
+| `--keywords`      | 自定义关键词，可传多个；指定后优先使用自定义词       |
+| `--scope`         | `china`（默认）、`global`（全球）、`all`（中国+全球） |
+| `--languages`     | 查询语言：`en/es/fr/pt/ar/hi/id/vi/zh`               |
+| `--countries`     | 全球模式追加国家限定词，如 `India Brazil South_Africa` |
 | `--sources`       | 按媒体名称过滤，名称见脚本内 `MEDIA`               |
 | `--years`         | 指定检索年份，默认 2000 年至当前年份               |
 | `--pages`         | 每个关键词/年份最多翻页数，默认 10                 |
@@ -829,6 +846,10 @@ python english_news_collector.py --inspect-search --bing-host cn --timeout 45
 | `--download-only` | 只读取指定 run 的 `news.json` 下载正文，不重新采集 |
 | `--delay`         | 请求间隔，默认 1.5 秒                              |
 | `--timeout`       | 请求超时时间，默认 20 秒；服务器代理慢可调到 45-60 秒 |
+| `--use-proxy`     | 启用内置 `127.0.0.1:7897` HTTP 代理             |
+| `--proxy`         | 指定完整代理地址，覆盖内置代理设置               |
+| `--proxy-host`    | `--use-proxy` 的代理主机，默认 `127.0.0.1`       |
+| `--proxy-port`    | `--use-proxy` 的代理端口，默认 `7897`            |
 | `--rss-threshold` | HTML 单次结果少于该数量时启用 RSS 兜底，默认 5    |
 | `--no-rss-fallback` | 关闭 RSS 兜底，仅使用 Bing HTML 页面             |
 | `--no-google-fallback` | 关闭 Google News RSS 第二层兜底                 |
@@ -853,10 +874,35 @@ python english_news_collector.py --check-search --bing-host cn
 python english_news_collector.py --inspect-search --bing-host cn --timeout 45
 
 # 3. cn 可用后正式采集
-python english_news_collector.py --pages 10 --delay 2 --download --bing-host cn --timeout 45
+python english_news_collector.py --pages 10 --delay 2 --download --bing-host cn --timeout 45 --use-proxy
 ```
 
 如果 `--inspect-search` 显示 HTML 只能解析到 1-3 条，正式采集时默认会自动尝试 Bing RSS，再尝试 Google News RSS；可在 `summary.md` 查看三类 fallback 的请求数和解析数。若只想验证 Bing HTML，使用 `--no-rss-fallback --no-google-fallback`。
+
+### 服务器代理
+
+服务器如果通过本机代理访问外网，脚本内置代理端口为 `127.0.0.1:7897`，但默认不强制启用。服务器上建议先用：
+
+```bash
+# 使用代码内置的 127.0.0.1:7897
+python english_news_collector.py --inspect-search --use-proxy --timeout 45
+
+# 确认代理可用后全量采集并下载
+python english_news_collector.py --pages 10 --delay 2 --timeout 45 --use-proxy --download
+
+# 如果代理不是本机，或端口不同，显式指定完整地址
+python english_news_collector.py --proxy http://127.0.0.1:7897 --pages 10 --delay 2 --download
+python english_news_collector.py --proxy http://PROXY_HOST:7897 --pages 10 --delay 2 --download
+```
+
+代码会对搜索、Bing RSS、Google News RSS 和正文下载统一使用该代理。也可以设置环境变量后不写参数：
+
+```bash
+export NEWS_PROXY=http://127.0.0.1:7897
+python english_news_collector.py --pages 10 --delay 2 --download
+```
+
+如果 `7897` 实际是 SOCKS5 端口，使用 `socks5h://127.0.0.1:7897`，并安装 `requests[socks]`；普通 HTTP 代理使用 `http://127.0.0.1:7897`。
 
 查看输出目录中的 `fail.log` 和 `debug/*.html`：
 
@@ -867,8 +913,8 @@ python english_news_collector.py --pages 10 --delay 2 --download --bing-host cn 
 
 `summary.md` 中的 `Duplicate/filtered results` 表示解析到了但已经被 URL 去重或来源过滤的结果；`Pages without new records` 表示某些分页没有新增 URL，但程序仍会继续翻页，不代表采集已经结束。
 
-### 英文新闻清洗
+### 多语种新闻清洗
 
-`english_news_cleaner.py` 只处理 `articles/` 下已经下载的 Markdown，已存在且有效的 `articles/clean/{id}.md` 会跳过。默认每 5 篇调用一次 DeepSeek，失败批次写入同一 run 的 `fail.log`，清洗完成后生成 `db_import.csv`。需要设置 `DEEPSEEK_API_KEY`，或通过 `--api-key` 传入。
+`english_news_cleaner.py` 只处理 `articles/` 下已经下载的 Markdown，已存在且有效的 `articles/clean/{id}.md` 会跳过。它会根据 `language` 保持原文语言清洗，默认每 5 篇调用一次 DeepSeek，失败批次写入同一 run 的 `fail.log`，清洗完成后生成 `db_import.csv`。需要设置 `DEEPSEEK_API_KEY`，或通过 `--api-key` 传入。
 
 ---

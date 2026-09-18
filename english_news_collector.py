@@ -35,6 +35,10 @@ logger = logging.getLogger("english_news")
 BASE_DIR = Path("data/processed/news/en")
 # Backward compatibility for runs created before the directory was moved.
 LEGACY_BASE_DIR = Path("data/processed/env_news")
+# Server proxy convention. Enable with ``--use-proxy`` or override with
+# ``--proxy`` / ``NEWS_PROXY``; direct access remains the default on laptops.
+DEFAULT_PROXY_HOST = "127.0.0.1"
+DEFAULT_PROXY_PORT = 7897
 KEYWORDS = [
     "China poverty", "China poverty alleviation", "China poverty reduction",
     "China poverty eradication", "targeted poverty alleviation China",
@@ -43,6 +47,48 @@ KEYWORDS = [
     "China rural poverty", "China poverty reduction policy",
     "China anti-poverty", "China development poverty",
 ]
+
+CHINA_KEYWORDS_BY_LANGUAGE = {
+    "en": KEYWORDS,
+    "zh": ["扶贫", "脱贫", "减贫", "贫困治理", "乡村振兴", "共同富裕"],
+}
+
+GLOBAL_KEYWORDS_BY_LANGUAGE = {
+    "en": [
+        "poverty alleviation", "poverty reduction", "poverty eradication",
+        "rural development", "social protection", "inclusive development",
+        "multidimensional poverty", "anti-poverty policy",
+    ],
+    "es": [
+        "reducción de la pobreza", "erradicación de la pobreza",
+        "desarrollo rural", "protección social", "desarrollo inclusivo",
+    ],
+    "fr": [
+        "réduction de la pauvreté", "éradication de la pauvreté",
+        "développement rural", "protection sociale", "développement inclusif",
+    ],
+    "pt": [
+        "redução da pobreza", "erradicação da pobreza",
+        "desenvolvimento rural", "proteção social", "desenvolvimento inclusivo",
+    ],
+    "ar": [
+        "الحد من الفقر", "القضاء على الفقر", "التنمية الريفية",
+        "الحماية الاجتماعية", "التنمية الشاملة",
+    ],
+    "hi": [
+        "गरीबी उन्मूलन", "गरीबी कम करना", "ग्रामीण विकास", "सामाजिक सुरक्षा",
+    ],
+    "id": [
+        "pengentasan kemiskinan", "pengurangan kemiskinan",
+        "pembangunan pedesaan", "perlindungan sosial",
+    ],
+    "vi": [
+        "giảm nghèo", "xóa đói giảm nghèo", "phát triển nông thôn",
+        "an sinh xã hội",
+    ],
+}
+
+DEFAULT_GLOBAL_LANGUAGES = ["en", "es", "fr", "pt", "ar"]
 
 MEDIA = {
     "CGTN": ["cgtn.com"],
@@ -60,7 +106,8 @@ MEDIA = {
 }
 
 FIELDS = ["id", "title", "url", "source", "date", "pub_date", "summary",
-          "is_official", "source_type", "search_keyword"]
+          "is_official", "source_type", "search_keyword", "language",
+          "country_focus", "scope"]
 
 
 def domain_matches(url: str, domains: Iterable[str]) -> bool:
@@ -97,6 +144,81 @@ def clean_source_name(value: str) -> str:
     return value.strip(" ·|-")
 
 
+def normalize_proxy_url(proxy: str = "", host: str = DEFAULT_PROXY_HOST,
+                        port: int = DEFAULT_PROXY_PORT) -> str:
+    """Normalize CLI proxy input into a requests-compatible URL."""
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return ""
+    if proxy.lower() in {"none", "off", "direct", "false"}:
+        return ""
+    if proxy.isdigit():
+        return f"http://{host}:{proxy}"
+    if "://" not in proxy:
+        proxy = f"http://{proxy}"
+    return proxy.rstrip("/")
+
+
+def proxy_label(proxy: str) -> str:
+    """Return a credential-free proxy label for logs and summaries."""
+    if not proxy:
+        return "direct/environment"
+    parsed = urlparse(proxy)
+    return f"{parsed.scheme}://{parsed.hostname or 'unknown'}:{parsed.port or ''}"
+
+
+def build_query_plan(custom_keywords: Optional[List[str]], scope: str,
+                     languages: Optional[List[str]], countries: Optional[List[str]]) -> Tuple[List[str], Dict[str, Dict], Dict]:
+    """Build query strings plus language/country metadata without exploding defaults."""
+    if custom_keywords:
+        metadata = {
+            keyword: {
+                "language": languages[0] if languages and len(languages) == 1 else "custom",
+                "country_focus": "",
+                "scope": scope,
+            }
+            for keyword in custom_keywords
+        }
+        return custom_keywords, metadata, {
+            "scope": scope, "languages": languages or ["custom"],
+            "countries": countries or [], "custom_keywords": True,
+        }
+
+    selected_languages = languages or (["en"] if scope == "china" else DEFAULT_GLOBAL_LANGUAGES)
+    selected_countries = countries or []
+    queries: List[str] = []
+    metadata: Dict[str, Dict] = {}
+
+    def add_query(query: str, language: str, country: str, query_scope: str) -> None:
+        if query not in metadata:
+            queries.append(query)
+            metadata[query] = {
+                "language": language,
+                "country_focus": country,
+                "scope": query_scope,
+            }
+
+    if scope in {"china", "all"}:
+        for language in selected_languages:
+            for keyword in CHINA_KEYWORDS_BY_LANGUAGE.get(language, []):
+                add_query(keyword, language, "China", "china")
+
+    if scope in {"global", "all"}:
+        for language in selected_languages:
+            for keyword in GLOBAL_KEYWORDS_BY_LANGUAGE.get(language, []):
+                add_query(keyword, language, "", "global")
+                for country in selected_countries:
+                    country_name = country.replace("_", " ")
+                    add_query(f"{keyword} {country_name}", language, country_name, "global")
+
+    if not queries:
+        raise ValueError(f"没有可用查询词: scope={scope}, languages={selected_languages}")
+    return queries, metadata, {
+        "scope": scope, "languages": selected_languages,
+        "countries": selected_countries, "custom_keywords": False,
+    }
+
+
 def parse_date(url: str, text: str = "") -> str:
     patterns = [
         r"/(20\d{2})[-/](\d{1,2})[-/](\d{1,2})(?:/|[-_])",
@@ -127,7 +249,9 @@ class EnglishNewsCollector:
     def __init__(self, run_id: Optional[str] = None, delay: float = 1.5,
         timeout: int = 20, bing_host: str = "auto",
         rss_fallback: bool = True, rss_threshold: int = 5,
-        google_fallback: bool = True):
+        google_fallback: bool = True, proxy: str = "",
+        proxy_host: str = DEFAULT_PROXY_HOST, proxy_port: int = DEFAULT_PROXY_PORT,
+        use_proxy: bool = False):
         self.run_id = run_id or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.data_dir = self._resolve_data_dir(self.run_id)
         self.articles_dir = self.data_dir / "articles"
@@ -139,6 +263,14 @@ class EnglishNewsCollector:
         self.rss_fallback = rss_fallback
         self.rss_threshold = max(1, rss_threshold)
         self.google_fallback = google_fallback
+        explicit_proxy = normalize_proxy_url(proxy, proxy_host, proxy_port)
+        if use_proxy and not explicit_proxy:
+            explicit_proxy = f"http://{proxy_host}:{proxy_port}"
+        self.proxy_url = explicit_proxy
+        env_proxy_enabled = any(os.environ.get(name) for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"))
+        self.proxy_display = proxy_label(explicit_proxy) if explicit_proxy else (
+            "environment" if env_proxy_enabled else "direct"
+        )
         self.debug_saved = 0
         self.debug_limit = 20
         self.search_stats = {
@@ -166,6 +298,13 @@ class EnglishNewsCollector:
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         })
+        if explicit_proxy:
+            self.session.proxies.update({"http": explicit_proxy, "https": explicit_proxy})
+            logger.info("网络代理已启用: %s", self.proxy_display)
+        elif any(os.environ.get(name) for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")):
+            logger.info("将沿用环境变量代理（未打印具体地址）")
+        else:
+            logger.info("网络代理: 未显式启用，使用直连")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.articles_dir.mkdir(parents=True, exist_ok=True)
 
@@ -191,10 +330,14 @@ class EnglishNewsCollector:
         return new_dir
 
     def collect(self, keywords: List[str], years: List[int], pages: int,
-                limit: Optional[int] = None, sources: Optional[List[str]] = None) -> List[Dict]:
+                limit: Optional[int] = None, sources: Optional[List[str]] = None,
+                query_meta: Optional[Dict[str, Dict]] = None,
+                plan_info: Optional[Dict] = None) -> List[Dict]:
         existing = self._load_json()
         seen = {a.get("url") for a in existing if a.get("url")}
         output = existing[:]
+        self.plan_info = plan_info or {"scope": "china", "languages": ["en"], "countries": []}
+        query_meta = query_meta or {}
         domains: List[str] = []
         if sources:
             for source in sources:
@@ -233,6 +376,10 @@ class EnglishNewsCollector:
                             continue
                         seen.add(url)
                         card["search_keyword"] = keyword
+                        meta = query_meta.get(keyword, {})
+                        card["language"] = meta.get("language", "en")
+                        card["country_focus"] = meta.get("country_focus", "")
+                        card["scope"] = meta.get("scope", self.plan_info.get("scope", "china"))
                         output.append(card)
                         page_new += 1
                         if limit and len(output) - len(existing) >= limit:
@@ -750,6 +897,9 @@ class EnglishNewsCollector:
     def _write_summary(self, total: int, success: int, failed: int, skipped: int) -> None:
         (self.data_dir / "summary.md").write_text(
             f"# English news run {self.run_id}\n\n"
+            f"- Scope: {getattr(self, 'plan_info', {}).get('scope', 'unknown')}\n"
+            f"- Languages: {', '.join(getattr(self, 'plan_info', {}).get('languages', []))}\n"
+            f"- Countries: {', '.join(getattr(self, 'plan_info', {}).get('countries', [])) or 'all/global'}\n"
             f"- Records: {total}\n- Download success: {success}\n"
             f"- Download failed: {failed}\n- Existing/skipped: {skipped}\n"
             f"- Search requests: {self.search_stats['requests']}\n"
@@ -764,6 +914,7 @@ class EnglishNewsCollector:
             f"- Google RSS parsed results: {self.search_stats['google_rss_results']}\n"
             f"- Duplicate/filtered results: {self.search_stats['duplicate_results']}\n"
             f"- Pages without new records: {self.search_stats['no_new_pages']}\n"
+            f"- Proxy: {self.proxy_display}\n"
             f"- Debug pages saved: {self.search_stats['debug_pages']}\n"
             f"- Last search reason: {self.search_stats['last_reason'] or 'None'}\n",
             encoding="utf-8")
@@ -776,7 +927,14 @@ class EnglishNewsCollector:
 def main() -> None:
     parser = argparse.ArgumentParser(description="国际英文新闻采集器")
     parser.add_argument("--run-id", help="复用已有 run；采集时增量写回，下载时断点续传")
-    parser.add_argument("--keywords", nargs="+", default=KEYWORDS)
+    parser.add_argument("--keywords", nargs="+",
+                        help="自定义关键词；不指定时由 --scope/--languages 自动生成")
+    parser.add_argument("--scope", choices=["china", "global", "all"], default="china",
+                        help="采集范围：china（默认）、global（全球）、all（中国+全球）")
+    parser.add_argument("--languages", nargs="+", choices=sorted(set(CHINA_KEYWORDS_BY_LANGUAGE) | set(GLOBAL_KEYWORDS_BY_LANGUAGE)),
+                        help="查询语言；global 默认 en/es/fr/pt/ar，all 可加入 zh/hi/id/vi")
+    parser.add_argument("--countries", nargs="+",
+                        help="全球模式的国家限定词，例如 India Brazil South_Africa；不指定则不展开国家组合")
     parser.add_argument("--sources", nargs="+", choices=list(MEDIA), help="只保留指定媒体")
     parser.add_argument("--years", nargs="+", type=int, default=list(range(2000, dt.date.today().year + 1)))
     parser.add_argument("--pages", type=int, default=10,
@@ -786,6 +944,14 @@ def main() -> None:
     parser.add_argument("--download-only", action="store_true", help="只下载已有 run，不重新搜索")
     parser.add_argument("--delay", type=float, default=1.5)
     parser.add_argument("--timeout", type=int, default=20, help="请求超时时间（秒），服务器代理较慢时可调大")
+    parser.add_argument("--use-proxy", action="store_true",
+                        help=f"启用本机 HTTP 代理 127.0.0.1:{DEFAULT_PROXY_PORT}")
+    parser.add_argument("--proxy", default=os.getenv("NEWS_PROXY", ""),
+                        help="指定代理地址，如 http://127.0.0.1:7897 或 socks5h://127.0.0.1:7897")
+    parser.add_argument("--proxy-host", default=DEFAULT_PROXY_HOST,
+                        help=f"--use-proxy 使用的代理主机，默认 {DEFAULT_PROXY_HOST}")
+    parser.add_argument("--proxy-port", type=int, default=DEFAULT_PROXY_PORT,
+                        help=f"--use-proxy 使用的代理端口，默认 {DEFAULT_PROXY_PORT}")
     parser.add_argument("--rss-threshold", type=int, default=5,
                         help="HTML 结果少于该数量时启用 Bing RSS 兜底，默认 5")
     parser.add_argument("--no-rss-fallback", action="store_true",
@@ -801,6 +967,12 @@ def main() -> None:
     parser.add_argument("--debug-query", default="China poverty 2024",
                         help="配合 --check-search/--inspect-search 使用的测试查询")
     args = parser.parse_args()
+    try:
+        keywords, query_meta, plan_info = build_query_plan(
+            args.keywords, args.scope, args.languages, args.countries
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     collector = EnglishNewsCollector(
         args.run_id,
         args.delay,
@@ -809,6 +981,10 @@ def main() -> None:
         rss_fallback=not args.no_rss_fallback,
         rss_threshold=args.rss_threshold,
         google_fallback=not args.no_google_fallback,
+        proxy=args.proxy,
+        proxy_host=args.proxy_host,
+        proxy_port=args.proxy_port,
+        use_proxy=args.use_proxy,
     )
     if args.inspect_search:
         ok = collector.inspect_search(args.debug_query)
@@ -823,7 +999,10 @@ def main() -> None:
         if not articles:
             parser.error(f"{collector.data_dir} 下没有 news.json，无法执行 --download-only")
     else:
-        articles = collector.collect(args.keywords, args.years, max(1, args.pages), args.limit, args.sources)
+        articles = collector.collect(
+            keywords, args.years, max(1, args.pages), args.limit, args.sources,
+            query_meta=query_meta, plan_info=plan_info,
+        )
     if args.download or args.download_only:
         collector.download(articles, args.limit)
     logger.info("完成: run=%s, 目录=%s, 记录=%s", collector.run_id, collector.data_dir, len(articles))
