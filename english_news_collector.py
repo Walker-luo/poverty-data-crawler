@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
@@ -39,6 +40,8 @@ KEYWORDS = [
     "China poverty eradication", "targeted poverty alleviation China",
     "China rural revitalization", "China rural development",
     "China common prosperity", "China poverty governance",
+    "China rural poverty", "China poverty reduction policy",
+    "China anti-poverty", "China development poverty",
 ]
 
 MEDIA = {
@@ -69,7 +72,29 @@ def source_from_url(url: str, fallback: str = "") -> str:
     for name, domains in MEDIA.items():
         if domain_matches(url, domains):
             return name
-    return fallback or urlparse(url).netloc
+    return clean_source_name(fallback) or urlparse(url).netloc
+
+
+def clean_source_name(value: str) -> str:
+    """Remove Bing relative-time suffixes from source labels."""
+    value = re.sub(r"\s+", " ", value or "").strip(" ·|-")
+    if not value:
+        return ""
+    if re.fullmatch(
+        r"\d+\s*(?:s|m|h|d|w|mo|mon|y|seconds?|minutes?|hours?|days?|weeks?|months?|years?)",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return ""
+    value = re.split(
+        r"\s+(?:\d+\s*(?:s|m|h|d|w|mo|mon|y)|\d+\s*"
+        r"(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)|"
+        r"today|yesterday)\b",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return value.strip(" ·|-")
 
 
 def parse_date(url: str, text: str = "") -> str:
@@ -97,9 +122,12 @@ class EnglishNewsCollector:
         "www": "https://www.bing.com/news/search",
         "cn": "https://cn.bing.com/news/search",
     }
+    GOOGLE_RSS_URL = "https://news.google.com/rss/search"
 
     def __init__(self, run_id: Optional[str] = None, delay: float = 1.5,
-        timeout: int = 20, bing_host: str = "auto"):
+        timeout: int = 20, bing_host: str = "auto",
+        rss_fallback: bool = True, rss_threshold: int = 5,
+        google_fallback: bool = True):
         self.run_id = run_id or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.data_dir = self._resolve_data_dir(self.run_id)
         self.articles_dir = self.data_dir / "articles"
@@ -108,6 +136,9 @@ class EnglishNewsCollector:
         self.delay = delay
         self.timeout = timeout
         self.bing_host = bing_host
+        self.rss_fallback = rss_fallback
+        self.rss_threshold = max(1, rss_threshold)
+        self.google_fallback = google_fallback
         self.debug_saved = 0
         self.debug_limit = 20
         self.search_stats = {
@@ -115,6 +146,15 @@ class EnglishNewsCollector:
             "failures": 0,
             "abnormal_empty": 0,
             "debug_pages": 0,
+            "rss_requests": 0,
+            "rss_hits": 0,
+            "html_results": 0,
+            "rss_results": 0,
+            "google_rss_requests": 0,
+            "google_rss_hits": 0,
+            "google_rss_results": 0,
+            "duplicate_results": 0,
+            "no_new_pages": 0,
             "last_reason": "",
         }
         self.session = requests.Session()
@@ -173,16 +213,23 @@ class EnglishNewsCollector:
             for keyword in keywords:
                 done += 1
                 query = f"{keyword} {year}"
+                page_signatures: Set[Tuple[str, ...]] = set()
                 for page in range(pages):
                     cards = self._fetch(query, page)
                     if not cards:
                         break
+                    signature = tuple(sorted({card["url"] for card in cards if card.get("url")}))
+                    if signature in page_signatures:
+                        logger.debug("分页结果重复，停止当前查询: %s page=%s", query, page)
+                        break
+                    page_signatures.add(signature)
                     page_new = 0
                     for card in cards:
                         url = card["url"]
                         if domains and not domain_matches(url, domains):
                             continue
                         if url in seen:
+                            self.search_stats["duplicate_results"] += 1
                             continue
                         seen.add(url)
                         card["search_keyword"] = keyword
@@ -193,7 +240,8 @@ class EnglishNewsCollector:
                             logger.info("达到本次 limit=%s，累计新增 %s 条", limit, len(output)-len(existing))
                             return output
                     if page_new == 0:
-                        break
+                        self.search_stats["no_new_pages"] += 1
+                        logger.debug("当前页均为重复/过滤结果，继续翻页: %s page=%s", query, page)
                     # 每页落盘，进程中断时保留已经拿到的结果
                     self._save(output)
                 if done % 5 == 0 or done == total:
@@ -204,6 +252,9 @@ class EnglishNewsCollector:
     def _fetch(self, query: str, page: int) -> List[Dict]:
         time.sleep(self.delay)
         errors = []
+        combined: List[Dict] = []
+        seen_urls: Set[str] = set()
+        normal_empty_hosts = 0
         for search_url in self._search_urls():
             try:
                 self.search_stats["requests"] += 1
@@ -218,14 +269,20 @@ class EnglishNewsCollector:
                 }, timeout=self.timeout)
                 response.raise_for_status()
                 results = self._parse(response.text)
+                self.search_stats["html_results"] += len(results)
                 if results:
-                    return results
+                    for item in results:
+                        if item["url"] not in seen_urls:
+                            seen_urls.add(item["url"])
+                            combined.append(item)
+                    continue
 
                 diag = self._diagnose_empty_response(response.text, response.url)
                 if diag["kind"] == "normal_empty":
+                    normal_empty_hosts += 1
                     if query == "China poverty 2024":
                         self._save_debug_page(query, page, response.text, "preflight_normal_empty")
-                    return []
+                    continue
 
                 self.search_stats["abnormal_empty"] += 1
                 self.search_stats["last_reason"] = diag["reason"]
@@ -244,10 +301,159 @@ class EnglishNewsCollector:
                 logger.warning("搜索失败 [%s] via %s: %s",
                                query, urlparse(search_url).netloc, type(exc).__name__)
 
+        # Bing HTML is often reduced or blocked on servers. RSS is a lighter
+        # response and usually survives proxies that alter the HTML page.
+        should_try_rss = (
+            self.rss_fallback
+            and len(combined) < self.rss_threshold
+            and (combined or normal_empty_hosts < len(self._search_urls()) or errors)
+        )
+        if should_try_rss:
+            for search_url in self._search_urls():
+                try:
+                    rss_results = self._fetch_rss(search_url, query, page)
+                    for item in rss_results:
+                        if item["url"] not in seen_urls:
+                            seen_urls.add(item["url"])
+                            combined.append(item)
+                    if rss_results:
+                        self.search_stats["rss_hits"] += 1
+                    if len(combined) >= self.rss_threshold:
+                        break
+                except requests.RequestException as exc:
+                    reason = f"RSS {type(exc).__name__}: {str(exc)[:180]}"
+                    errors.append(f"{urlparse(search_url).netloc}: {reason}")
+                    logger.warning("RSS 搜索失败 [%s] via %s: %s",
+                                   query, urlparse(search_url).netloc, type(exc).__name__)
+                except (ET.ParseError, ValueError) as exc:
+                    reason = f"RSS {type(exc).__name__}: {str(exc)[:180]}"
+                    errors.append(f"{urlparse(search_url).netloc}: {reason}")
+
+        if (
+            self.google_fallback
+            and len(combined) < self.rss_threshold
+            and (combined or normal_empty_hosts < len(self._search_urls()) or errors)
+        ):
+            try:
+                google_results = self._fetch_google_rss(query)
+                for item in google_results:
+                    if item["url"] not in seen_urls:
+                        seen_urls.add(item["url"])
+                        combined.append(item)
+                if google_results:
+                    self.search_stats["google_rss_hits"] += 1
+            except requests.RequestException as exc:
+                reason = f"Google RSS {type(exc).__name__}: {str(exc)[:180]}"
+                errors.append(reason)
+                logger.warning("Google RSS 搜索失败 [%s]: %s", query, type(exc).__name__)
+            except (ET.ParseError, ValueError) as exc:
+                errors.append(f"Google RSS {type(exc).__name__}: {str(exc)[:180]}")
+
+        if combined:
+            return combined
+        if normal_empty_hosts == len(self._search_urls()) and not errors:
+            return []
+
         self.search_stats["failures"] += 1
         self._log_fail("search", f"{query} page={page}", " | ".join(self._search_urls()),
                        " ; ".join(errors) if errors else "unknown search error")
         return []
+
+    def _fetch_rss(self, search_url: str, query: str, page: int) -> List[Dict]:
+        self.search_stats["rss_requests"] += 1
+        response = self.session.get(search_url, params={
+            "q": query,
+            "first": page * 10 + 1,
+            "format": "rss",
+            "setmkt": "en-US",
+            "mkt": "en-US",
+            "ensearch": "1",
+        }, timeout=self.timeout)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        results: List[Dict] = []
+        for item in root.iter():
+            if self._xml_local_name(item.tag) != "item":
+                continue
+            values = {}
+            for child in item:
+                name = self._xml_local_name(child.tag)
+                values[name] = (child.text or "").strip()
+            url = self._normalize_bing_href(values.get("link", ""))
+            if not url:
+                continue
+            title = re.sub(r"\s+", " ", values.get("title", "")).strip()
+            if len(title) < 8:
+                continue
+            source = source_from_url(url, values.get("source", ""))
+            description = BeautifulSoup(values.get("description", ""), "lxml").get_text(" ", strip=True)
+            results.append({
+                "id": self._id(url), "title": title[:500], "url": url,
+                "source": source, "date": values.get("pubDate", ""),
+                "pub_date": parse_date(url, values.get("pubDate", "")),
+                "summary": description[:500], "is_official": source in {
+                    "CGTN", "Xinhua English", "People's Daily Online", "China Daily", "english.gov.cn"
+                }, "source_type": "news", "search_keyword": "",
+            })
+        self.search_stats["rss_results"] += len(results)
+        return results
+
+    def _fetch_google_rss(self, query: str) -> List[Dict]:
+        self.search_stats["google_rss_requests"] += 1
+        response = self.session.get(self.GOOGLE_RSS_URL, params={
+            "q": query,
+            "hl": "en-US",
+            "gl": "US",
+            "ceid": "US:en",
+        }, timeout=self.timeout)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        results: List[Dict] = []
+        for item in root.iter():
+            if self._xml_local_name(item.tag) != "item":
+                continue
+            values = {}
+            source_label = ""
+            for child in item:
+                name = self._xml_local_name(child.tag)
+                text = (child.text or "").strip()
+                values[name] = text
+                if name == "source":
+                    source_label = text
+
+            description_html = values.get("description", "")
+            description_soup = BeautifulSoup(description_html, "lxml")
+            direct_url = ""
+            for anchor in description_soup.select("a[href]"):
+                candidate = anchor.get("href", "")
+                host = urlparse(candidate).netloc.lower()
+                if candidate.startswith("http") and "news.google.com" not in host:
+                    direct_url = candidate
+                    break
+            url = direct_url or values.get("link", "")
+            if not url:
+                continue
+            title = re.sub(r"\s+", " ", values.get("title", "")).strip()
+            if len(title) < 8:
+                continue
+            if not source_label and " - " in title:
+                source_label = title.rsplit(" - ", 1)[-1]
+            source = source_from_url(url, source_label)
+            description = description_soup.get_text(" ", strip=True)
+            results.append({
+                "id": self._id(url), "title": title[:500], "url": url,
+                "source": source, "date": values.get("pubDate", ""),
+                "pub_date": parse_date(url, values.get("pubDate", "")),
+                "summary": description[:500], "is_official": source in {
+                    "CGTN", "Xinhua English", "People's Daily Online", "China Daily", "english.gov.cn"
+                }, "source_type": "news", "search_keyword": "",
+            })
+        self.search_stats["google_rss_results"] += len(results)
+        return results
+
+    @staticmethod
+    def _xml_local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
 
     def inspect_search(self, query: str = "China poverty 2024", page: int = 0) -> bool:
         """Print one-request diagnostics for each Bing host without collecting data."""
@@ -325,13 +531,18 @@ class EnglishNewsCollector:
             if not link or not url:
                 continue
             title = re.sub(r"\s+", " ", link.get_text(" ", strip=True))
+            if not title:
+                title = link.get("aria-label", "") or link.get("title", "")
+            if not title:
+                heading = card.select_one("h2, h3, [class*=title]")
+                title = heading.get_text(" ", strip=True) if heading else ""
             if len(title) < 8:
                 continue
             text = re.sub(r"\s+", " ", card.get_text(" ", strip=True))
             source = source_from_url(url)
             source_el = card.select_one("[class*=source], [class*=author]")
             if source_el:
-                source = source_from_url(url, source_el.get_text(" ", strip=True))
+                source = source_from_url(url, clean_source_name(source_el.get_text(" ", strip=True)))
             results.append({
                 "id": self._id(url), "title": title[:500], "url": url,
                 "source": source, "date": "", "pub_date": parse_date(url, text),
@@ -358,6 +569,11 @@ class EnglishNewsCollector:
         for link in soup.select("a[href]"):
             url = self._normalize_bing_href(link.get("href", ""))
             title = re.sub(r"\s+", " ", link.get_text(" ", strip=True))
+            if not title:
+                title = link.get("aria-label", "") or link.get("title", "")
+            if not title:
+                heading = link.parent.select_one("h2, h3, [class*=title]") if link.parent else None
+                title = heading.get_text(" ", strip=True) if heading else ""
             if not url or url in seen or len(title) < 12 or self._is_non_news_url(url):
                 continue
             seen.add(url)
@@ -380,7 +596,7 @@ class EnglishNewsCollector:
         blocked_hosts = (
             "microsoft.com", "go.microsoft.com", "support.microsoft.com",
             "privacy.microsoft.com", "login.live.com", "account.microsoft.com",
-            "office.com", "aka.ms",
+            "office.com", "aka.ms", "beian.miit.gov.cn", "dxzhgl.miit.gov.cn",
         )
         return any(host == item or host.endswith("." + item) for item in blocked_hosts)
 
@@ -539,6 +755,15 @@ class EnglishNewsCollector:
             f"- Search requests: {self.search_stats['requests']}\n"
             f"- Search failures: {self.search_stats['failures']}\n"
             f"- Abnormal empty pages: {self.search_stats['abnormal_empty']}\n"
+            f"- HTML parsed results: {self.search_stats['html_results']}\n"
+            f"- RSS fallback requests: {self.search_stats['rss_requests']}\n"
+            f"- RSS fallback hits: {self.search_stats['rss_hits']}\n"
+            f"- RSS parsed results: {self.search_stats['rss_results']}\n"
+            f"- Google RSS fallback requests: {self.search_stats['google_rss_requests']}\n"
+            f"- Google RSS fallback hits: {self.search_stats['google_rss_hits']}\n"
+            f"- Google RSS parsed results: {self.search_stats['google_rss_results']}\n"
+            f"- Duplicate/filtered results: {self.search_stats['duplicate_results']}\n"
+            f"- Pages without new records: {self.search_stats['no_new_pages']}\n"
             f"- Debug pages saved: {self.search_stats['debug_pages']}\n"
             f"- Last search reason: {self.search_stats['last_reason'] or 'None'}\n",
             encoding="utf-8")
@@ -554,12 +779,19 @@ def main() -> None:
     parser.add_argument("--keywords", nargs="+", default=KEYWORDS)
     parser.add_argument("--sources", nargs="+", choices=list(MEDIA), help="只保留指定媒体")
     parser.add_argument("--years", nargs="+", type=int, default=list(range(2000, dt.date.today().year + 1)))
-    parser.add_argument("--pages", type=int, default=3)
+    parser.add_argument("--pages", type=int, default=10,
+                        help="每个关键词/年份最多翻页数，默认 10")
     parser.add_argument("--limit", type=int, help="本次采集或下载最多处理多少条")
     parser.add_argument("--download", action="store_true", help="下载新闻正文")
     parser.add_argument("--download-only", action="store_true", help="只下载已有 run，不重新搜索")
     parser.add_argument("--delay", type=float, default=1.5)
     parser.add_argument("--timeout", type=int, default=20, help="请求超时时间（秒），服务器代理较慢时可调大")
+    parser.add_argument("--rss-threshold", type=int, default=5,
+                        help="HTML 结果少于该数量时启用 Bing RSS 兜底，默认 5")
+    parser.add_argument("--no-rss-fallback", action="store_true",
+                        help="关闭 Bing RSS 兜底，仅使用 HTML 页面")
+    parser.add_argument("--no-google-fallback", action="store_true",
+                        help="关闭 Google News RSS 兜底")
     parser.add_argument("--bing-host", choices=["auto", "www", "cn"], default="auto",
                         help="Bing 域名策略：auto 先试 www 再试 cn；服务器访问异常时可指定 cn")
     parser.add_argument("--check-search", action="store_true",
@@ -569,7 +801,15 @@ def main() -> None:
     parser.add_argument("--debug-query", default="China poverty 2024",
                         help="配合 --check-search/--inspect-search 使用的测试查询")
     args = parser.parse_args()
-    collector = EnglishNewsCollector(args.run_id, args.delay, timeout=args.timeout, bing_host=args.bing_host)
+    collector = EnglishNewsCollector(
+        args.run_id,
+        args.delay,
+        timeout=args.timeout,
+        bing_host=args.bing_host,
+        rss_fallback=not args.no_rss_fallback,
+        rss_threshold=args.rss_threshold,
+        google_fallback=not args.no_google_fallback,
+    )
     if args.inspect_search:
         ok = collector.inspect_search(args.debug_query)
         logger.info("搜索诊断完成: %s | run=%s | 目录=%s", "可解析" if ok else "不可解析", collector.run_id, collector.data_dir)

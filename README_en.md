@@ -781,7 +781,7 @@ data/processed/report/{run_id}/
 python english_news_collector.py --limit 5
 
 # 指定关键词、年份和翻页深度
-python english_news_collector.py --keywords "China rural revitalization" "China poverty" --years 2020 2021 2022 2023 2024 2025 2026 --pages 3
+python english_news_collector.py --keywords "China rural revitalization" "China poverty" --years 2020 2021 2022 2023 2024 2025 2026 --pages 10
 
 # 只保留指定媒体
 python english_news_collector.py --sources Reuters BBC CGTN --limit 20
@@ -809,9 +809,13 @@ python english_news_collector.py --inspect-search --bing-host cn --timeout 45
 
 采集每完成一页就写回 `news.json/news.csv`。下载每完成一篇就更新 `download_log.json`，记录 `success` 或 `failed` 及原因；因此程序中断后可以使用 `--download-only` 继续已有 run，不会重新检索新闻。
 
-如果本机能采集、服务器 0 条，优先执行 `--check-search`。脚本会请求固定测试词 `China poverty 2024`，并把异常页面保存到 `data/processed/news/en/{run_id}/debug/`，同时在 `fail.log` 写明是请求失败、验证码/反爬、被重定向到首页、正常无结果，还是 Bing HTML 结构变化。`--download` 会先搜索再下载；如果服务器搜索阶段就是 0 条，后续自然不会下载正文。
+如果本机能采集、服务器只有少量结果，优先执行 `--check-search`。脚本会请求固定测试词 `China poverty 2024`，并把异常页面保存到 `data/processed/news/en/{run_id}/debug/`，同时在 `fail.log` 写明是请求失败、验证码/反爬、被重定向到首页、正常无结果，还是 Bing HTML 结构变化。`--download` 会先搜索再下载；如果服务器搜索阶段就是 0 条，后续自然不会下载正文。
 
 需要更详细排查时用 `--inspect-search`，它会分别打印 `www.bing.com` / `cn.bing.com` 的 HTTP 状态码、最终 URL、页面标题、响应长度和解析到的新闻数量。可以配合 `--debug-query` 改测试词。
+
+采集器在 `auto` 模式下会合并 `www.bing.com` 和 `cn.bing.com` 的结果；当 HTML 结果不足 `--rss-threshold` 条时，会自动请求 Bing RSS，再不足时请求 Google News RSS 作为第二层兜底。`summary.md` 会记录 HTML/Bing RSS/Google RSS 请求数和解析结果数，便于判断服务器是否只返回了精简页面。默认 `--pages` 已改为 10；如果服务器出口容易被限流，可手动降低到 1-3 并增大 `--delay`。
+
+分页不会因为“当前页全是前面关键词已经采过的 URL”而提前停止。只有返回空页，或同一个查询连续返回完全相同的分页结果时才停止；这样可以继续访问后续页，减少关键词重叠导致的漏采。
 
 | 参数              | 作用                                               |
 | ----------------- | -------------------------------------------------- |
@@ -819,12 +823,15 @@ python english_news_collector.py --inspect-search --bing-host cn --timeout 45
 | `--keywords`      | 自定义英文关键词，可传多个                         |
 | `--sources`       | 按媒体名称过滤，名称见脚本内 `MEDIA`               |
 | `--years`         | 指定检索年份，默认 2000 年至当前年份               |
-| `--pages`         | 每个关键词/年份最多翻页数，默认 3                  |
+| `--pages`         | 每个关键词/年份最多翻页数，默认 10                 |
 | `--limit`         | 限制本次新增采集或正文下载数量                     |
 | `--download`      | 下载新闻正文为 Markdown                            |
 | `--download-only` | 只读取指定 run 的 `news.json` 下载正文，不重新采集 |
 | `--delay`         | 请求间隔，默认 1.5 秒                              |
 | `--timeout`       | 请求超时时间，默认 20 秒；服务器代理慢可调到 45-60 秒 |
+| `--rss-threshold` | HTML 单次结果少于该数量时启用 RSS 兜底，默认 5    |
+| `--no-rss-fallback` | 关闭 RSS 兜底，仅使用 Bing HTML 页面             |
+| `--no-google-fallback` | 关闭 Google News RSS 第二层兜底                 |
 | `--bing-host`     | Bing 域名策略：`auto` 先试 `www` 再试 `cn`；服务器异常时可指定 `cn` |
 | `--check-search`  | 只做 Bing 新闻搜索预检，保存诊断，不采集数据       |
 | `--inspect-search`| 输出状态码/最终 URL/标题/解析数量，排查服务器 0 条 |
@@ -839,6 +846,7 @@ python english_news_collector.py --check-search
 # 1.1 更详细诊断：分别查看 www/cn 的状态码、最终 URL、标题、解析数量
 python english_news_collector.py --inspect-search
 python english_news_collector.py --inspect-search --debug-query "China rural revitalization 2024"
+python english_news_collector.py --inspect-search --timeout 45
 
 # 2. 如果 www.bing.com 异常，指定 cn.bing.com 再测
 python english_news_collector.py --check-search --bing-host cn
@@ -848,12 +856,16 @@ python english_news_collector.py --inspect-search --bing-host cn --timeout 45
 python english_news_collector.py --pages 10 --delay 2 --download --bing-host cn --timeout 45
 ```
 
+如果 `--inspect-search` 显示 HTML 只能解析到 1-3 条，正式采集时默认会自动尝试 Bing RSS，再尝试 Google News RSS；可在 `summary.md` 查看三类 fallback 的请求数和解析数。若只想验证 Bing HTML，使用 `--no-rss-fallback --no-google-fallback`。
+
 查看输出目录中的 `fail.log` 和 `debug/*.html`：
 
 - `疑似验证码/反爬/访问被拦截`：服务器出口 IP 或代理被 Bing 拦截，换代理/出口 IP，或加大 `--delay`
 - `被重定向到非 news/search 页面`：服务器访问 Bing 被地区页/首页接管，尝试 `--bing-host cn`
 - `响应过短`：代理或网关返回错误页，检查 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量
 - `未发现新闻卡片或外部新闻链接`：Bing 返回的 HTML 结构和本机不同，把 `debug/*.html` 用浏览器打开即可定位
+
+`summary.md` 中的 `Duplicate/filtered results` 表示解析到了但已经被 URL 去重或来源过滤的结果；`Pages without new records` 表示某些分页没有新增 URL，但程序仍会继续翻页，不代表采集已经结束。
 
 ### 英文新闻清洗
 
