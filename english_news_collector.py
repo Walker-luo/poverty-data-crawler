@@ -88,7 +88,8 @@ GLOBAL_KEYWORDS_BY_LANGUAGE = {
     ],
 }
 
-DEFAULT_GLOBAL_LANGUAGES = ["en", "es", "fr", "pt", "ar"]
+DEFAULT_GLOBAL_LANGUAGES = ["en", "es", "fr", "pt", "ar", "hi", "id", "vi"]
+DEFAULT_ALL_LANGUAGES = ["en", "zh", "es", "fr", "pt", "ar", "hi", "id", "vi"]
 
 MEDIA = {
     "CGTN": ["cgtn.com"],
@@ -184,7 +185,14 @@ def build_query_plan(custom_keywords: Optional[List[str]], scope: str,
             "countries": countries or [], "custom_keywords": True,
         }
 
-    selected_languages = languages or (["en"] if scope == "china" else DEFAULT_GLOBAL_LANGUAGES)
+    if languages:
+        selected_languages = languages
+    elif scope == "china":
+        selected_languages = ["en"]
+    elif scope == "global":
+        selected_languages = DEFAULT_GLOBAL_LANGUAGES
+    else:
+        selected_languages = DEFAULT_ALL_LANGUAGES
     selected_countries = countries or []
     queries: List[str] = []
     metadata: Dict[str, Dict] = {}
@@ -929,10 +937,10 @@ def main() -> None:
     parser.add_argument("--run-id", help="复用已有 run；采集时增量写回，下载时断点续传")
     parser.add_argument("--keywords", nargs="+",
                         help="自定义关键词；不指定时由 --scope/--languages 自动生成")
-    parser.add_argument("--scope", choices=["china", "global", "all"], default="china",
-                        help="采集范围：china（默认）、global（全球）、all（中国+全球）")
+    parser.add_argument("--scope", choices=["china", "global", "all"], default="all",
+                        help="采集范围：all（默认全量）、china（中国）、global（全球）")
     parser.add_argument("--languages", nargs="+", choices=sorted(set(CHINA_KEYWORDS_BY_LANGUAGE) | set(GLOBAL_KEYWORDS_BY_LANGUAGE)),
-                        help="查询语言；global 默认 en/es/fr/pt/ar，all 可加入 zh/hi/id/vi")
+                        help="查询语言；all 默认 en/zh/es/fr/pt/ar/hi/id/vi，global 默认不含 zh")
     parser.add_argument("--countries", nargs="+",
                         help="全球模式的国家限定词，例如 India Brazil South_Africa；不指定则不展开国家组合")
     parser.add_argument("--sources", nargs="+", choices=list(MEDIA), help="只保留指定媒体")

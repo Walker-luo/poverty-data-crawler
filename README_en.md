@@ -774,11 +774,19 @@ data/processed/report/{run_id}/
 
 默认关键词覆盖 `China poverty`、`China poverty alleviation`、`China poverty reduction`、`targeted poverty alleviation China`、`China rural revitalization`、`China common prosperity` 等。内置媒体包括 CGTN、Xinhua English、People's Daily Online、China Daily、english.gov.cn，以及 Reuters、BBC、The Guardian、SCMP、The Diplomat、Sixth Tone、Caixin Global。
 
+当前无参数运行 `python english_news_collector.py` 即执行默认全量采集：范围为中国 + 全球，使用内置多语种关键词，年份覆盖 2000 年至当前年份，默认每个关键词/年份最多 10 页，不设置 `--limit`。`--countries` 是额外的国家限定扩展，默认不展开，因为它会使查询组合数量成倍增加。
+
 ### 基本命令
 
 ```bash
-# 小批量采集，每个运行最多新增 5 条
-python english_news_collector.py --limit 5
+# 默认全量采集：中国 + 全球多语种关键词
+python english_news_collector.py
+
+# 默认全量采集并下载正文（服务器代理）
+python english_news_collector.py --use-proxy --delay 2 --timeout 45 --download
+
+# 中国英文小批量测试
+python english_news_collector.py --scope china --languages en --years 2024 2025 2026 --pages 1 --limit 30
 
 # 全球多语种小批量测试
 python english_news_collector.py --scope global --languages en es fr --years 2024 2025 2026 --pages 1 --limit 30
@@ -817,7 +825,7 @@ python english_news_collector.py --inspect-search --use-proxy --timeout 45
 
 `--limit` 表示本次新增采集或本次下载最多处理多少条。采集器按 URL 去重；正文下载检查 `articles/{id}.md`，中断后重复执行会继续处理未完成条目。失败会实时追加到 `fail.log`，终端显示进度，`summary.md` 保存最近一次汇总。指定旧 run ID 时，程序也会兼容读取此前的 `data/processed/env_news/{run_id}/` 目录。
 
-默认 `--scope china` 保持原有中国英文语料逻辑。需要扩大到全球扶贫治理时使用 `--scope global`；需要中国与全球一起采集使用 `--scope all`。`--languages` 支持英语 `en`、西班牙语 `es`、法语 `fr`、葡萄牙语 `pt`、阿拉伯语 `ar`、印地语 `hi`、印尼语 `id`、越南语 `vi` 和中文 `zh`。`--countries` 会把国家名追加到全球关键词后，例如 `poverty reduction India`，不指定时只使用全球通用关键词，避免请求数量失控。
+默认 `--scope all` 执行全量采集，覆盖中国与全球扶贫治理。需要只采中国时使用 `--scope china`；只采全球时使用 `--scope global`。`--languages` 支持英语 `en`、西班牙语 `es`、法语 `fr`、葡萄牙语 `pt`、阿拉伯语 `ar`、印地语 `hi`、印尼语 `id`、越南语 `vi` 和中文 `zh`。`--countries` 会把国家名追加到全球关键词后，例如 `poverty reduction India`；默认不展开国家组合，避免无参数全量任务产生过多查询。
 
 新采集的 `news.csv/news.json` 会额外记录：`language`（查询语言）、`country_focus`（国家限定词，全球通用查询为空）和 `scope`（`china` / `global`）。清洗器会把这些信息传给大模型，生成 `db_import.csv` 时中国资源标记为 `china`，指定国家写入“地区”，其他全球资源标记为 `global`。
 
@@ -835,8 +843,8 @@ python english_news_collector.py --inspect-search --use-proxy --timeout 45
 | ----------------- | -------------------------------------------------- |
 | `--run-id`        | 指定已有目录，执行增量采集或断点下载               |
 | `--keywords`      | 自定义关键词，可传多个；指定后优先使用自定义词       |
-| `--scope`         | `china`（默认）、`global`（全球）、`all`（中国+全球） |
-| `--languages`     | 查询语言：`en/es/fr/pt/ar/hi/id/vi/zh`               |
+| `--scope`         | `all`（默认全量）、`china`（中国）、`global`（全球） |
+| `--languages`     | 查询语言；all 默认 `en/zh/es/fr/pt/ar/hi/id/vi`     |
 | `--countries`     | 全球模式追加国家限定词，如 `India Brazil South_Africa` |
 | `--sources`       | 按媒体名称过滤，名称见脚本内 `MEDIA`               |
 | `--years`         | 指定检索年份，默认 2000 年至当前年份               |
