@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import time
+import warnings
 import xml.etree.ElementTree as ET
 from html import unescape
 from pathlib import Path
@@ -1083,6 +1084,29 @@ class EnglishNewsCollector:
                 variants.append(clean_url)
         return variants
 
+    def _get_article_response(self, url: str) -> requests.Response:
+        """Fetch one article URL; retry once without certificate verification on SSL errors.
+
+        Search requests keep normal certificate verification. The relaxed retry is
+        limited to the failing article URL so one certificate issue does not abort
+        the whole download run.
+        """
+        headers = {"Referer": "https://www.bing.com/"}
+        try:
+            return self.session.get(url, timeout=self.timeout, headers=headers)
+        except requests.exceptions.SSLError as exc:
+            host = urlparse(url).netloc or url
+            detail = str(exc).splitlines()[0][:160]
+            logger.warning("正文 SSL 校验失败，尝试当前 URL 重试: %s (%s)", host, detail)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return self.session.get(
+                    url,
+                    timeout=self.timeout,
+                    headers=headers,
+                    verify=False,
+                )
+
     def _fetch_article(self, url: str) -> Tuple[requests.Response, str]:
         """Fetch and extract an article, following safe canonical/AMP fallbacks."""
         last_response: Optional[requests.Response] = None
@@ -1098,8 +1122,8 @@ class EnglishNewsCollector:
             if attempt:
                 time.sleep(min(1.0, max(0.2, self.delay / 2)))
             attempt += 1
-            response = self.session.get(candidate_url, timeout=self.timeout,
-                                        headers={"Referer": "https://www.bing.com/"})
+            response = self._get_article_response(candidate_url)
+            # Keep HTTP errors visible after normal and SSL-fallback requests.
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "lxml")
             text = self._extract_article_text(soup)

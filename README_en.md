@@ -835,6 +835,10 @@ python english_news_collector.py --inspect-search --use-proxy --timeout 45
 
 需要更详细排查时用 `--inspect-search`，它会分别打印 `www.bing.com` / `cn.bing.com` 的 HTTP 状态码、最终 URL、页面标题、响应长度和解析到的新闻数量。可以配合 `--debug-query` 改测试词。
 
+正文下载的 HTTPS 证书处理：默认先按系统/certifi 进行正常证书校验；如果某个新闻站点在 Windows 服务器或代理环境下触发 SSLCertVerificationError，脚本只对当前正文 URL 自动使用 verify=False 重试一次，并局部抑制对应的警告，不会全局关闭搜索请求的证书校验。重试仍失败、或返回 403/404/429、验证码、JS 拦截页时，仍会按失败处理，并实时写入 fail.log 与 download_log.json。该机制不能绕过站点封禁或代理不可达问题。
+
+Windows 服务器建议先更新证书和网络依赖：`python -m pip install -U certifi requests urllib3`，检查系统时间、代理地址及代理是否允许 HTTPS CONNECT；也可用 `--use-proxy --proxy 127.0.0.1:7897`（或设置 NEWS_PROXY）运行。若服务器没有可用代理，不要开启 `--use-proxy`。
+
 采集器在 `auto` 模式下会合并 `www.bing.com` 和 `cn.bing.com` 的结果；当 HTML 结果不足 `--rss-threshold` 条时，会自动请求 Bing RSS，再不足时请求 Google News RSS 作为第二层兜底。`summary.md` 会记录 HTML/Bing RSS/Google RSS 请求数和解析结果数，便于判断服务器是否只返回了精简页面。默认 `--pages` 已改为 10；如果服务器出口容易被限流，可手动降低到 1-3 并增大 `--delay`。
 
 分页不会因为“当前页全是前面关键词已经采过的 URL”而提前停止。只有返回空页，或同一个查询连续返回完全相同的分页结果时才停止；这样可以继续访问后续页，减少关键词重叠导致的漏采。
