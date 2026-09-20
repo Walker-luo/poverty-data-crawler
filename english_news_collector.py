@@ -20,6 +20,7 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from html import unescape
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
@@ -831,6 +832,292 @@ class EnglishNewsCollector:
         import hashlib
         return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
 
+    @staticmethod
+    def _normalise_article_text(value: str) -> str:
+        """Collapse HTML whitespace while keeping paragraph boundaries."""
+        value = re.sub(r"\xa0", " ", value or "")
+        value = re.sub(r"[ \t\r\f\v]+", " ", value)
+        value = re.sub(r"\n[ \t]+", "\n", value)
+        value = re.sub(r"\n{3,}", "\n\n", value)
+        return value.strip()
+
+    @classmethod
+    def _json_ld_article_bodies(cls, soup: BeautifulSoup) -> List[str]:
+        """Read articleBody from JSON-LD used by MSN and many news CMSs."""
+        bodies: List[str] = []
+
+        def walk(value) -> None:
+            if isinstance(value, dict):
+                body = value.get("articleBody")
+                if isinstance(body, str) and body.strip():
+                    bodies.append(cls._normalise_article_text(body))
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        for script in soup.select('script[type="application/ld+json"]'):
+            raw = script.string or script.get_text()
+            if not raw.strip():
+                continue
+            try:
+                walk(json.loads(raw))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                # Some pages append invalid JSON after a valid articleBody.
+                match = re.search(r'"articleBody"\s*:\s*"((?:\\.|[^"\\])*)"', raw, re.S)
+                if match:
+                    try:
+                        body = json.loads('"' + match.group(1) + '"')
+                    except (json.JSONDecodeError, ValueError):
+                        body = match.group(1).replace("\\n", "\n").replace('\\"', '"')
+                    if body.strip():
+                        bodies.append(cls._normalise_article_text(body))
+        return [body for body in bodies if len(body) >= 120]
+
+    @classmethod
+    def _embedded_article_bodies(cls, soup: BeautifulSoup) -> List[str]:
+        """Recover article text serialized in application JSON by SPA sites."""
+        bodies: List[str] = []
+        body_keys = {
+            "articlebody", "article_body", "articletext", "article_text",
+            "bodytext", "body_text", "fulltext", "full_text",
+        }
+        structured_keys = {
+            "body", "content", "contents", "paragraphs", "blocks",
+            "article", "articlecontent", "article_content", "story",
+        }
+
+        def add(value: str) -> None:
+            value = unescape(value or "")
+            if "<" in value and ">" in value:
+                value = BeautifulSoup(value, "lxml").get_text(" ", strip=True)
+            value = cls._normalise_article_text(value)
+            punctuation = sum(value.count(mark) for mark in ".!?。！？")
+            if len(value) >= 160 and punctuation >= 2 and value not in bodies:
+                bodies.append(value)
+
+        def collect_structured(value) -> None:
+            """Join text-bearing nodes used by React/Next/SPA article blocks."""
+            parts: List[str] = []
+
+            def collect(node) -> None:
+                if isinstance(node, str):
+                    value = cls._normalise_article_text(
+                        BeautifulSoup(unescape(node), "lxml").get_text(" ", strip=True)
+                        if "<" in node and ">" in node else unescape(node)
+                    )
+                    if len(value) >= 20:
+                        parts.append(value)
+                elif isinstance(node, list):
+                    for child in node:
+                        collect(child)
+                elif isinstance(node, dict):
+                    for key in ("text", "value", "html", "markup", "children", "content"):
+                        if key in node:
+                            collect(node[key])
+
+            collect(value)
+            add("\n\n".join(parts))
+
+        def walk(value) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    normalized_key = str(key).lower().replace("-", "_")
+                    if normalized_key in body_keys:
+                        if isinstance(child, str):
+                            add(child)
+                        elif isinstance(child, (dict, list)):
+                            collect_structured(child)
+                    elif normalized_key in structured_keys:
+                        if isinstance(child, str):
+                            add(child)
+                        elif isinstance(child, (dict, list)):
+                            collect_structured(child)
+                    elif isinstance(child, (dict, list)):
+                        walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        for script in soup.select("script"):
+            raw = script.string or script.get_text()
+            if not raw.strip() or "{" not in raw:
+                continue
+            try:
+                walk(json.loads(raw))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                # JSON is often assigned to ``window.__DATA__`` rather than
+                # being the complete script body.
+                start, end = raw.find("{"), raw.rfind("}")
+                if start >= 0 and end > start:
+                    try:
+                        walk(json.loads(raw[start:end + 1]))
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
+                # Also support a JSON fragment embedded in a JavaScript assignment.
+                for key in body_keys:
+                    match = re.search(
+                        rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"', raw, re.I | re.S
+                    )
+                    if match:
+                        try:
+                            add(json.loads('"' + match.group(1) + '"'))
+                        except (json.JSONDecodeError, ValueError):
+                            add(match.group(1).replace("\\n", "\n").replace('\\"', '"'))
+        return bodies
+
+    @staticmethod
+    def _related_article_urls(response: requests.Response) -> List[str]:
+        """Find canonical/AMP URLs that may contain the publisher's full text."""
+        soup = BeautifulSoup(response.text, "lxml")
+        urls: List[str] = []
+        selectors = [
+            "link[rel='canonical'][href]",
+            "link[rel='amphtml'][href]",
+            "link[rel='alternate'][href]",
+            "meta[property='og:url'][content]",
+            "meta[name='twitter:url'][content]",
+        ]
+        for node in soup.select(", ".join(selectors)):
+            raw = node.get("href") or node.get("content") or ""
+            candidate = urljoin(response.url, raw.strip())
+            if urlparse(candidate).scheme in {"http", "https"} and candidate not in urls:
+                urls.append(candidate)
+        return urls[:4]
+
+    @classmethod
+    def _container_text(cls, container) -> str:
+        """Extract text from both paragraph-based and div-based article layouts."""
+        if not container:
+            return ""
+
+        blocks: List[str] = []
+        for node in container.select("p, h2, h3, h4, blockquote"):
+            value = cls._normalise_article_text(node.get_text(" ", strip=True))
+            if len(value) >= 20 and value not in blocks:
+                blocks.append(value)
+        paragraph_text = "\n\n".join(blocks)
+        if len(paragraph_text) >= 120:
+            return paragraph_text
+
+        # Older government/CMS pages put each sentence in a div or table cell.
+        # Use the complete container only when paragraph extraction was too short;
+        # this avoids duplicating nested div text on normal pages.
+        fallback = cls._normalise_article_text(container.get_text("\n", strip=True))
+        lines = []
+        for line in fallback.splitlines():
+            line = cls._normalise_article_text(line)
+            if len(line) >= 20 and line not in lines:
+                lines.append(line)
+        return "\n\n".join(lines) or cls._normalise_article_text(container.get_text(" ", strip=True))
+
+    @classmethod
+    def _extract_article_text(cls, soup: BeautifulSoup) -> str:
+        """Extract an article body without mistaking an error page for content."""
+        json_bodies = cls._json_ld_article_bodies(soup)
+        if json_bodies:
+            return max(json_bodies, key=len)
+        embedded_bodies = cls._embedded_article_bodies(soup)
+        if embedded_bodies:
+            return max(embedded_bodies, key=len)
+
+        for tag in soup.select(
+            "script, style, nav, footer, header, aside, form, iframe, noscript, svg, "
+            "[role='navigation'], [aria-hidden='true'], [hidden], "
+            ".cookie, .cookies, .advert, .advertisement, .ad, .related, .recommend, "
+            ".share, .social, .breadcrumb, .pagination"
+        ):
+            tag.decompose()
+
+        selectors = [
+            "[itemprop='articleBody']", "article", "main",
+            "[class*='article-body']", "[class*='article-content']",
+            "[class*='story-body']", "[class*='story-content']",
+            "[class*='post-content']", "[class*='entry-content']",
+            "[class*='detail-content']", "[class*='content-detail']",
+            "[class*='article']", "[data-testid*='article']", "[data-article-body]",
+            "[id*='article-body']", "[id*='article-content']",
+            "[id*='story-body']", "[id*='content']", "[class*='content']",
+            "body",
+        ]
+        candidates = []
+        seen = set()
+        for selector in selectors:
+            for container in soup.select(selector):
+                marker = id(container)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                text = cls._container_text(container)
+                if len(text) < 80:
+                    continue
+                link_text = sum(len(a.get_text(" ", strip=True)) for a in container.select("a"))
+                link_ratio = link_text / max(len(text), 1)
+                paragraphs = len(container.select("p"))
+                score = len(text) + min(paragraphs * 80, 800) - int(link_ratio * 500)
+                candidates.append((score, text))
+        return max(candidates, key=lambda item: item[0])[1] if candidates else ""
+
+    @staticmethod
+    def _is_error_page(response: requests.Response, text: str) -> bool:
+        """Reject captcha, access-denied and obvious registry pages."""
+        lower = (text or "").lower()
+        markers = (
+            "verify you are human", "captcha", "access denied", "unusual traffic",
+            "request blocked", "enable javascript to continue", "robot check",
+            "增值电信业务经营许可证", "京公网安备", "备案号",
+        )
+        return response.status_code in {401, 403, 429, 451, 521} or any(
+            marker in lower for marker in markers
+        )
+
+    def _article_url_variants(self, url: str) -> List[str]:
+        """Return a small set of safe URL variants for syndicated pages."""
+        variants = [url]
+        parsed = urlparse(url)
+        if parsed.netloc.lower().endswith("msn.com") and parsed.query:
+            clean_url = parsed._replace(query="", fragment="").geturl()
+            if clean_url not in variants:
+                variants.append(clean_url)
+        return variants
+
+    def _fetch_article(self, url: str) -> Tuple[requests.Response, str]:
+        """Fetch and extract an article, following safe canonical/AMP fallbacks."""
+        last_response: Optional[requests.Response] = None
+        last_text = ""
+        candidates = self._article_url_variants(url)
+        attempted: Set[str] = set()
+        attempt = 0
+        while candidates and attempt < 5:
+            candidate_url = candidates.pop(0)
+            if candidate_url in attempted:
+                continue
+            attempted.add(candidate_url)
+            if attempt:
+                time.sleep(min(1.0, max(0.2, self.delay / 2)))
+            attempt += 1
+            response = self.session.get(candidate_url, timeout=self.timeout,
+                                        headers={"Referer": "https://www.bing.com/"})
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "lxml")
+            text = self._extract_article_text(soup)
+            last_response, last_text = response, text
+            is_error = self._is_error_page(response, text) or (
+                len(text) < 120 and self._is_error_page(response, response.text)
+            )
+            if is_error or len(text) < 120:
+                for related_url in self._related_article_urls(response):
+                    if related_url not in attempted and related_url not in candidates:
+                        candidates.append(related_url)
+                continue
+            if len(text) >= 120:
+                return response, text
+        if last_response is None:
+            raise ValueError("未获取到响应")
+        return last_response, last_text
+
     def download(self, articles: List[Dict], limit: Optional[int] = None) -> Tuple[int, int, int]:
         status = self._load_download_status()
         candidates = [a for a in articles
@@ -842,18 +1129,18 @@ class EnglishNewsCollector:
         logger.info("正文下载: 待处理 %s 篇 | 已存在跳过 %s 篇", total, skipped)
         for index, article in enumerate(candidates, 1):
             try:
+                if self._is_probably_non_article_url(article["url"]):
+                    raise ValueError("疑似专题页/备案页，跳过正文下载")
                 time.sleep(self.delay)
-                response = self.session.get(article["url"], timeout=self.timeout)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, "lxml")
-                for tag in soup.select("script,style,nav,footer,header,aside,form,iframe"):
-                    tag.decompose()
-                container = next((soup.select_one(sel) for sel in
-                                  ["article", "main", "[class*=article-body]", "[class*=article-content]", "[class*=content]"]
-                                  if soup.select_one(sel)), soup.body)
-                text = "\n\n".join(p.get_text(" ", strip=True) for p in container.select("p") if len(p.get_text(strip=True)) > 20) if container else ""
-                if len(text) < 100:
-                    raise ValueError("正文过短")
+                response, text = self._fetch_article(article["url"])
+                if self._is_error_page(response, text) or (
+                    len(text) < 120 and self._is_error_page(response, response.text)
+                ):
+                    raise ValueError("疑似验证码/拦截页或备案页")
+                if len(text) < 120:
+                    raise ValueError(
+                        f"正文过短({len(text)}字符，HTML {len(response.content)} bytes)"
+                    )
                 path = self.articles_dir / f"{article['id']}.md"
                 path.write_text(f"# {article['title']}\n\n{text}\n", encoding="utf-8")
                 success += 1
@@ -870,6 +1157,23 @@ class EnglishNewsCollector:
                 logger.info("正文进度: %s/%s | 成功 %s | 失败 %s | 跳过 %s", index, total, success, failed, skipped)
         self._write_summary(len(articles), success, failed, skipped)
         return success, failed, skipped
+
+    @staticmethod
+    def _is_probably_non_article_url(url: str) -> bool:
+        """Identify URLs that are useful search results but not article pages."""
+        parsed = urlparse(url)
+        host = parsed.netloc.lower().split(":", 1)[0]
+        path = unquote(parsed.path).lower().rstrip("/")
+        blocked_hosts = {
+            "beian.miit.gov.cn", "beian.mps.gov.cn", "dxzhgl.miit.gov.cn",
+        }
+        if host in blocked_hosts:
+            return True
+        blocked_fragments = (
+            "/topics/", "/topic/", "/tag/", "/category/", "/search",
+            "/nature-index/article/",
+        )
+        return any(fragment in path for fragment in blocked_fragments)
 
     def _load_download_status(self) -> Dict:
         path = self.data_dir / "download_log.json"

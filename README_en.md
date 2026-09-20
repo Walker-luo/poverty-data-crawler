@@ -823,7 +823,7 @@ python english_news_collector.py --inspect-search --bing-host cn --timeout 45
 python english_news_collector.py --inspect-search --use-proxy --timeout 45
 ```
 
-`--limit` 表示本次新增采集或本次下载最多处理多少条。采集器按 URL 去重；正文下载检查 `articles/{id}.md`，中断后重复执行会继续处理未完成条目。失败会实时追加到 `fail.log`，终端显示进度，`summary.md` 保存最近一次汇总。指定旧 run ID 时，程序也会兼容读取此前的 `data/processed/env_news/{run_id}/` 目录。
+`--limit` 表示本次新增采集或本次下载最多处理多少条。采集器按 URL 去重；正文下载检查 `articles/{id}.md`，中断后重复执行会继续处理未完成条目。正文提取会依次尝试 JSON-LD 的 `articleBody`、SPA 内嵌的 `content/blocks/paragraphs`、canonical/AMP/`og:url` 关联页面、常见新闻正文容器和 div/表格文本，因此可兼容 MSN、政府旧 CMS 等没有标准 `<p>` 的页面；专题页、备案页、验证码和拦截页会被识别并记录具体跳过原因。失败会实时追加到 `fail.log`，终端显示进度，`summary.md` 保存最近一次汇总。指定旧 run ID 时，程序也会兼容读取此前的 `data/processed/env_news/{run_id}/` 目录。
 
 默认 `--scope all` 执行全量采集，覆盖中国与全球扶贫治理。需要只采中国时使用 `--scope china`；只采全球时使用 `--scope global`。`--languages` 支持英语 `en`、西班牙语 `es`、法语 `fr`、葡萄牙语 `pt`、阿拉伯语 `ar`、印地语 `hi`、印尼语 `id`、越南语 `vi` 和中文 `zh`。`--countries` 会把国家名追加到全球关键词后，例如 `poverty reduction India`；默认不展开国家组合，避免无参数全量任务产生过多查询。
 
