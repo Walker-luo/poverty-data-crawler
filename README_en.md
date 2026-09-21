@@ -812,6 +812,9 @@ python english_news_collector.py --run-id 20260916_120000 --limit 100 --download
 # 只对已有 run 下载正文，不重新访问 Bing
 python english_news_collector.py --run-id 20260916_120000 --download-only --limit 20
 
+# 代理恢复后，只重试 Google News 链接的历史 SSL 失败
+python english_news_collector.py --run-id 20260916_120000 --download-only --retry-failed google-ssl --use-proxy --proxy-port 7897
+
 # 对已下载正文进行英文 LLM 清洗，并生成数据库导入 CSV
 python english_news_cleaner.py --run-id 20260916_120000 --batch-size 5 --limit 20
 
@@ -830,6 +833,8 @@ python english_news_collector.py --inspect-search --use-proxy --timeout 45
 新采集的 `news.csv/news.json` 会额外记录：`language`（查询语言）、`country_focus`（国家限定词，全球通用查询为空）和 `scope`（`china` / `global`）。清洗器会把这些信息传给大模型，生成 `db_import.csv` 时中国资源标记为 `china`，指定国家写入“地区”，其他全球资源标记为 `global`。
 
 采集每完成一页就写回 `news.json/news.csv`。下载每完成一篇就更新 `download_log.json`，记录 `success` 或 `failed` 及原因；因此程序中断后可以使用 `--download-only` 继续已有 run，不会重新检索新闻。
+
+若代理中断导致一批 Google News 跳转链接出现 `SSLError`，恢复代理后使用 `--retry-failed google-ssl`，只会选择 `download_log.json` 中 `status=failed` 且错误属于 `news.google.com` SSL 的记录，不处理其他失败项或从未下载的文章。`--retry-failed ssl` 会重试所有站点的 SSL 失败，`--retry-failed all` 会重试全部历史失败；三种模式均跳过已有正文和成功记录，也可配合 `--limit 10` 小批量测试。筛选依据是 `download_log.json`，不依赖 `fail.log`。
 
 如果本机能采集、服务器只有少量结果，优先执行 `--check-search`。脚本会请求固定测试词 `China poverty 2024`，并把异常页面保存到 `data/processed/news/en/{run_id}/debug/`，同时在 `fail.log` 写明是请求失败、验证码/反爬、被重定向到首页、正常无结果，还是 Bing HTML 结构变化。`--download` 会先搜索再下载；如果服务器搜索阶段就是 0 条，后续自然不会下载正文。
 
@@ -856,6 +861,7 @@ Windows 服务器建议先更新证书和网络依赖：`python -m pip install -
 | `--limit`         | 限制本次新增采集或正文下载数量                     |
 | `--download`      | 下载新闻正文为 Markdown                            |
 | `--download-only` | 只读取指定 run 的 `news.json` 下载正文，不重新采集 |
+| `--retry-failed`  | 配合 `--download-only`，仅重试 `google-ssl` / `ssl` / `all` 历史失败 |
 | `--delay`         | 请求间隔，默认 1.5 秒                              |
 | `--timeout`       | 请求超时时间，默认 20 秒；服务器代理慢可调到 45-60 秒 |
 | `--use-proxy`     | 启用内置 `127.0.0.1:7897` HTTP 代理             |

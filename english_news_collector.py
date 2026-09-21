@@ -1142,11 +1142,47 @@ class EnglishNewsCollector:
             raise ValueError("未获取到响应")
         return last_response, last_text
 
-    def download(self, articles: List[Dict], limit: Optional[int] = None) -> Tuple[int, int, int]:
+    @staticmethod
+    def _matches_failed_retry(article: Dict, entry: Dict, mode: str) -> bool:
+        """Check whether a prior failed download belongs to a retry subset."""
+        if entry.get("status") != "failed":
+            return False
+        if mode == "all":
+            return True
+
+        reason = str(entry.get("reason") or "").lower()
+        url = str(article.get("url") or "").lower()
+        is_ssl = "sslerror" in reason or "ssl error" in reason
+        if mode == "ssl":
+            return is_ssl
+        if mode == "google-ssl":
+            return is_ssl and ("news.google.com" in reason or "news.google.com" in url)
+        return False
+
+    def download(
+        self,
+        articles: List[Dict],
+        limit: Optional[int] = None,
+        retry_failed: Optional[str] = None,
+    ) -> Tuple[int, int, int]:
         status = self._load_download_status()
-        candidates = [a for a in articles
-                      if not (self.articles_dir / f"{a['id']}.md").exists()
-                      and status.get(a["id"], {}).get("status") != "success"]
+        if retry_failed:
+            candidates = [
+                article for article in articles
+                if not (self.articles_dir / f"{article['id']}.md").exists()
+                and self._matches_failed_retry(
+                    article, status.get(article["id"], {}), retry_failed
+                )
+            ]
+            logger.info(
+                "失败重试筛选: %s | download_log.json 中匹配 %s 篇",
+                retry_failed,
+                len(candidates),
+            )
+        else:
+            candidates = [a for a in articles
+                          if not (self.articles_dir / f"{a['id']}.md").exists()
+                          and status.get(a["id"], {}).get("status") != "success"]
         if limit:
             candidates = candidates[:limit]
         total, success, failed, skipped = len(candidates), 0, 0, len(articles) - len(candidates)
@@ -1278,6 +1314,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="本次采集或下载最多处理多少条")
     parser.add_argument("--download", action="store_true", help="下载新闻正文")
     parser.add_argument("--download-only", action="store_true", help="只下载已有 run，不重新搜索")
+    parser.add_argument(
+        "--retry-failed",
+        choices=["google-ssl", "ssl", "all"],
+        help=("只重试 download_log.json 中的历史失败项：google-ssl 仅重试 "
+              "news.google.com 的 SSL 错误，ssl 重试全部 SSL 错误，all 重试全部失败"),
+    )
     parser.add_argument("--delay", type=float, default=1.5)
     parser.add_argument("--timeout", type=int, default=20, help="请求超时时间（秒），服务器代理较慢时可调大")
     parser.add_argument("--use-proxy", action="store_true",
@@ -1303,6 +1345,8 @@ def main() -> None:
     parser.add_argument("--debug-query", default="China poverty 2024",
                         help="配合 --check-search/--inspect-search 使用的测试查询")
     args = parser.parse_args()
+    if args.retry_failed and not args.download_only:
+        parser.error("--retry-failed 必须与 --download-only 一起使用")
     try:
         keywords, query_meta, plan_info = build_query_plan(
             args.keywords, args.scope, args.languages, args.countries
@@ -1340,7 +1384,7 @@ def main() -> None:
             query_meta=query_meta, plan_info=plan_info,
         )
     if args.download or args.download_only:
-        collector.download(articles, args.limit)
+        collector.download(articles, args.limit, retry_failed=args.retry_failed)
     logger.info("完成: run=%s, 目录=%s, 记录=%s", collector.run_id, collector.data_dir, len(articles))
 
 
