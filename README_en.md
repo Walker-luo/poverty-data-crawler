@@ -770,7 +770,7 @@ data/processed/report/{run_id}/
 
 ## 三、国际英文新闻采集
 
-`english_news_collector.py` 独立于中文新闻流水线，采集关于中国贫困治理、减贫、脱贫、乡村振兴和共同富裕的英文新闻。默认结果保存到 `data/processed/news/en/{run_id}/`，包括 `news.json`、`news.csv`、`summary.md`、`fail.log` 和正文目录 `articles/{id}.md`。其中 `en` 与 `data/processed/news/{run_id}/` 的中文新闻目录分开。
+`english_news_collector.py` 独立于中文新闻流水线，采集关于中国贫困治理、减贫、脱贫、乡村振兴和共同富裕的英文新闻。默认结果保存到 `data/processed/news/en/{run_id}/`，包括 `news.json`、`news.csv`、`summary.md`、`fail.log`、正文目录 `articles/{id}.md` 和下载汇总 `articles/download_summary.md`。其中 `en` 与 `data/processed/news/{run_id}/` 的中文新闻目录分开。
 
 默认关键词覆盖 `China poverty`、`China poverty alleviation`、`China poverty reduction`、`targeted poverty alleviation China`、`China rural revitalization`、`China common prosperity` 等。内置媒体包括 CGTN、Xinhua English、People's Daily Online、China Daily、english.gov.cn，以及 Reuters、BBC、The Guardian、SCMP、The Diplomat、Sixth Tone、Caixin Global。
 
@@ -832,7 +832,7 @@ python english_news_collector.py --inspect-search --use-proxy --timeout 45
 
 新采集的 `news.csv/news.json` 会额外记录：`language`（查询语言）、`country_focus`（国家限定词，全球通用查询为空）和 `scope`（`china` / `global`）。清洗器会把这些信息传给大模型，生成 `db_import.csv` 时中国资源标记为 `china`，指定国家写入“地区”，其他全球资源标记为 `global`。
 
-采集每完成一页就写回 `news.json/news.csv`。下载每完成一篇就更新 `download_log.json`，记录 `success` 或 `failed` 及原因；因此程序中断后可以使用 `--download-only` 继续已有 run，不会重新检索新闻。
+采集每完成一页就写回 `news.json/news.csv`。下载每完成一篇就更新 `download_log.json`，记录 `success` 或 `failed` 及原因，同时实时更新 `articles/download_summary.md`。该文件汇总元数据总数、已经下载、失败、未下载/待处理和状态记录异常数量，并单独记录本次运行的选中数、成功数、失败数、跳过数和 `--limit` 延后数。因此程序中断后也能直接查看当前进度，再使用 `--download-only` 继续已有 run，不会重新检索新闻。
 
 若代理中断导致一批 Google News 跳转链接出现 `SSLError`，恢复代理后使用 `--retry-failed google-ssl`，只会选择 `download_log.json` 中 `status=failed` 且错误属于 `news.google.com` SSL 的记录，不处理其他失败项或从未下载的文章。`--retry-failed ssl` 会重试所有站点的 SSL 失败，`--retry-failed all` 会重试全部历史失败；三种模式均跳过已有正文和成功记录，也可配合 `--limit 10` 小批量测试。筛选依据是 `download_log.json`，不依赖 `fail.log`。
 

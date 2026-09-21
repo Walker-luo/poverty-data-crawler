@@ -57,6 +57,7 @@ data/processed/
 │   ├── news.json
 │   ├── news.csv
 │   ├── articles/
+│   │   └── download_summary.md
 │   ├── download_log.json
 │   ├── fail.log
 │   └── summary.md
@@ -160,6 +161,7 @@ python english_news_collector.py --download-only --run-id <RUN_ID> --use-proxy -
 - Bing HTML 结果不足时可使用 Bing RSS 和 Google News RSS 兜底。
 - 数据固定存入 `data/processed/news/en/{run_id}/`，旧目录 `data/processed/env_news/` 仅作兼容。
 - `download_log.json` 是正文下载状态的主要依据：成功项跳过，失败项可在续跑时重试；`fail.log` 用于人工诊断，不应作为唯一状态源。
+- `articles/download_summary.md` 汇总正文文件的成功、失败、待处理和状态异常数量，并在下载过程中实时更新。
 - 正文下载默认正常校验证书；仅遇到 `SSLError` 时，对当前 URL 使用 `verify=False` 再尝试一次。403、404、429、验证码和 JS 页面仍应按失败记录。
 - 当前正文下载逻辑会尝试页面正文和候选 canonical/AMP/`og:url` 页面，以减少“正文过短”。
 

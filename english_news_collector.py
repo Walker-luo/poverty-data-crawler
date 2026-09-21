@@ -265,6 +265,7 @@ class EnglishNewsCollector:
         self.run_id = run_id or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.data_dir = self._resolve_data_dir(self.run_id)
         self.articles_dir = self.data_dir / "articles"
+        self.download_report = self.articles_dir / "download_summary.md"
         self.debug_dir = self.data_dir / "debug"
         self.fail_log = self.data_dir / "fail.log"
         self.delay = delay
@@ -1183,10 +1184,25 @@ class EnglishNewsCollector:
             candidates = [a for a in articles
                           if not (self.articles_dir / f"{a['id']}.md").exists()
                           and status.get(a["id"], {}).get("status") != "success"]
+        available = len(candidates)
         if limit:
             candidates = candidates[:limit]
-        total, success, failed, skipped = len(candidates), 0, 0, len(articles) - len(candidates)
+        total, success, failed = len(candidates), 0, 0
+        existing_skipped = len(articles) - available
+        deferred_by_limit = available - total
+        skipped = existing_skipped + deferred_by_limit
         logger.info("正文下载: 待处理 %s 篇 | 已存在跳过 %s 篇", total, skipped)
+        current_run = {
+            "mode": retry_failed or "incremental",
+            "available": available,
+            "selected": total,
+            "processed": 0,
+            "success": 0,
+            "failed": 0,
+            "existing_skipped": existing_skipped,
+            "deferred_by_limit": deferred_by_limit,
+        }
+        self._write_download_report(articles, status, current_run)
         for index, article in enumerate(candidates, 1):
             try:
                 if self._is_probably_non_article_url(article["url"]):
@@ -1213,9 +1229,14 @@ class EnglishNewsCollector:
                 status[article["id"]] = {"status": "failed", "reason": reason,
                                           "updated_at": dt.datetime.now().isoformat()}
             self._save_download_status(status)
+            current_run["processed"] = index
+            current_run["success"] = success
+            current_run["failed"] = failed
+            self._write_download_report(articles, status, current_run)
             if index % 10 == 0 or index == total:
                 logger.info("正文进度: %s/%s | 成功 %s | 失败 %s | 跳过 %s", index, total, success, failed, skipped)
         self._write_summary(len(articles), success, failed, skipped)
+        logger.info("下载情况已写入: %s", self.download_report)
         return success, failed, skipped
 
     @staticmethod
@@ -1247,6 +1268,73 @@ class EnglishNewsCollector:
     def _save_download_status(self, status: Dict) -> None:
         (self.data_dir / "download_log.json").write_text(
             json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _download_counts(self, articles: List[Dict], status: Dict) -> Dict[str, int]:
+        """Count the durable download state from files and the status log."""
+        counts = {
+            "total": len(articles),
+            "downloaded": 0,
+            "failed": 0,
+            "pending": 0,
+            "success_without_file": 0,
+        }
+        for article in articles:
+            path = self.articles_dir / f"{article['id']}.md"
+            entry = status.get(article["id"], {})
+            if path.is_file() and path.stat().st_size > 0:
+                counts["downloaded"] += 1
+            elif entry.get("status") == "failed":
+                counts["failed"] += 1
+            elif entry.get("status") == "success":
+                counts["success_without_file"] += 1
+            else:
+                counts["pending"] += 1
+        return counts
+
+    def _write_download_report(
+        self,
+        articles: List[Dict],
+        status: Dict,
+        current_run: Dict[str, object],
+    ) -> None:
+        """Write a human-readable download report inside ``articles/``."""
+        counts = self._download_counts(articles, status)
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        processed = int(current_run.get("processed", 0))
+        selected = int(current_run.get("selected", 0))
+        progress = f"{processed}/{selected}" if selected else "0/0"
+        report = (
+            f"# English news download summary\n\n"
+            f"- Run ID: `{self.run_id}`\n"
+            f"- Last updated: {now}\n"
+            f"- Metadata records: {counts['total']}\n"
+            f"- Downloaded Markdown: {counts['downloaded']}\n"
+            f"- Failed: {counts['failed']}\n"
+            f"- Not downloaded/pending: {counts['pending']}\n"
+            f"- Success status but file missing: {counts['success_without_file']}\n\n"
+            f"## Current invocation\n\n"
+            f"- Mode: `{current_run.get('mode', 'incremental')}`\n"
+            f"- Eligible historical items: {current_run.get('available', 0)}\n"
+            f"- Selected this time: {selected}\n"
+            f"- Progress: {progress}\n"
+            f"- Success this time: {current_run.get('success', 0)}\n"
+            f"- Failed this time: {current_run.get('failed', 0)}\n"
+            f"- Existing/status skipped: {current_run.get('existing_skipped', 0)}\n"
+            f"- Deferred by limit: {current_run.get('deferred_by_limit', 0)}\n\n"
+            f"## Related files\n\n"
+            f"- Per-article status: `../download_log.json`\n"
+            f"- Failure details: `../fail.log`\n"
+        )
+        temporary = self.download_report.with_suffix(".md.tmp")
+        try:
+            temporary.write_text(report, encoding="utf-8")
+            temporary.replace(self.download_report)
+        except OSError as exc:
+            logger.warning("无法写入下载汇总 %s: %s", self.download_report, exc)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _load_json(self) -> List[Dict]:
         path = self.data_dir / "news.json"
