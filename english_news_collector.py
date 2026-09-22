@@ -265,7 +265,7 @@ class EnglishNewsCollector:
         self.run_id = run_id or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.data_dir = self._resolve_data_dir(self.run_id)
         self.articles_dir = self.data_dir / "articles"
-        self.download_report = self.articles_dir / "download_summary.md"
+        self.download_report = self.data_dir / "download_summary.md"
         self.debug_dir = self.data_dir / "debug"
         self.fail_log = self.data_dir / "fail.log"
         self.delay = delay
