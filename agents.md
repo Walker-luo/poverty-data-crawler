@@ -31,6 +31,7 @@
 | `utils/news_md_downloader.py` | 中文新闻正文下载、失败记录、断点跳过 |
 | `utils/llm_cleaner.py` | 中文新闻 DeepSeek 批量清洗和 `db_import.csv` |
 | `english_news_collector.py` | 国际多语种新闻搜索与正文下载 |
+| `english_news_export_csv.py` | 国际新闻直接从 news.csv 导出数据库 CSV，无需 LLM |
 | `english_news_cleaner.py` | 国际新闻 DeepSeek 清洗 |
 | `academic_collector.py` | OpenAlex/Crossref 学术元数据、引文扩展、全文下载 |
 | `academic_export_csv.py` | 学术数据导出数据库 CSV |
@@ -56,6 +57,7 @@ data/processed/
 ├── news/en/{run_id}/               # 国际多语种新闻
 │   ├── news.json
 │   ├── news.csv
+│   ├── db_import.csv               # 元数据导出或 LLM 清洗导出
 │   ├── articles/
 │   │   └── download_summary.md
 │   ├── download_log.json
@@ -120,6 +122,7 @@ python english_news_collector.py --download
 python english_news_collector.py --download-only --run-id <RUN_ID>
 python english_news_collector.py --download-only --run-id <RUN_ID> --limit 10
 python english_news_cleaner.py --run-id <RUN_ID> --limit 5
+python english_news_export_csv.py --run-id <RUN_ID> --no-attachments
 ```
 
 Windows 服务器需走本机 7897 代理时：
@@ -162,6 +165,7 @@ python english_news_collector.py --download-only --run-id <RUN_ID> --use-proxy -
 - 数据固定存入 `data/processed/news/en/{run_id}/`，旧目录 `data/processed/env_news/` 仅作兼容。
 - `download_log.json` 是正文下载状态的主要依据：成功项跳过，失败项可在续跑时重试；`fail.log` 用于人工诊断，不应作为唯一状态源。
 - `articles/download_summary.md` 汇总正文文件的成功、失败、待处理和状态异常数量，并在下载过程中实时更新。
+- `english_news_export_csv.py` 可直接把采集元数据导出为数据库 CSV，描述使用原始搜索摘要；清洗器也会生成同名 CSV，运行顺序决定最终内容。
 - 正文下载默认正常校验证书；仅遇到 `SSLError` 时，对当前 URL 使用 `verify=False` 再尝试一次。403、404、429、验证码和 JS 页面仍应按失败记录。
 - 当前正文下载逻辑会尝试页面正文和候选 canonical/AMP/`og:url` 页面，以减少“正文过短”。
 

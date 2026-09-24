@@ -1,15 +1,16 @@
 # 国外语料 CSV 导入简要说明
 
-本文档给后续导入数据库的 agent 使用，用于理解 `academic_export_csv.py` 和 `report_export_csv.py` 生成的 `db_import.csv`。
+本文档给后续导入数据库的 agent 使用，用于理解学术、报告和国际新闻导出脚本生成的 `db_import.csv`。
 
 ## 适用文件
 
 ```text
 data/processed/academic/{RUN_ID}/db_import.csv   # 英文学术文献
 data/processed/report/{RUN_ID}/db_import.csv     # 国际组织报告
+data/processed/news/en/{RUN_ID}/db_import.csv    # 国际新闻（未清洗元数据）
 ```
 
-两个 CSV 字段基本一致，可以按同一套数据库导入规则处理。
+三种 CSV 字段一致，可以按同一套数据库导入规则处理。
 
 ## 字段组成
 
@@ -23,18 +24,18 @@ data/processed/report/{RUN_ID}/db_import.csv     # 国际组织报告
 | 字段 | 含义 |
 |---|---|
 | `*文件名` | 资源稳定 ID，不是标题，也不一定是物理附件名 |
-| `*标题` | 论文或报告标题 |
-| `描述 / 内容` | 摘要优先；摘要为空时可能由全文 PDF/XML/TXT 提取补充 |
-| `*分类` | 学术文献为 `academic`；国际组织报告为 `reports` |
+| `*标题` | 论文、报告或新闻标题 |
+| `描述 / 内容` | 学术/报告优先使用摘要；国际新闻直接使用搜索摘要，未调用 LLM |
+| `*分类` | 学术文献为 `academic`；国际组织报告为 `reports`；国际新闻为 `news` |
 | `*类型` | 固定为 `text` |
 | `*国家` | 中国相关为 `china`；其他一般为 `global` |
 | `地区` | 中国相关一般为 `asia`，其他可为空 |
 | `关键词` | 从标题、摘要、元数据关键词或 concepts 中提取 |
 | `发展阶段` | 仅中国相关资源填写；非中国资源通常为空 |
-| `*话语类型` | 学术文献为 `academic`；国际组织报告为 `institutional` |
+| `*话语类型` | 学术文献为 `academic`；国际组织报告为 `institutional`；国际新闻按官媒标记分为 `institutional` / `civilian` |
 | `发布日期` | 标准日期；只有年份时通常补为 `YYYY-01-01` |
 | `来源` | 学术文献为期刊/来源库；报告为机构名称 |
-| `原始URL` | 原始网页、DOI 或报告页面 |
+| `原始URL` | 原始网页、DOI 或报告页面；国际新闻可用该链接打开来源页 |
 | `文件地址` | 附件相对路径；没有附件时为 `None` |
 
 ## `*文件名` 规则
@@ -46,6 +47,7 @@ data/processed/report/{RUN_ID}/db_import.csv     # 国际组织报告
 | OpenAlex | `W2606951880` |
 | Crossref | `10.1016/j.worlddev.2024.106789` |
 | 国际组织报告 | `10665/62630` |
+| 国际新闻 | `9b45d7b87cd06696`（news.csv 中的 `id`） |
 
 真实附件位置看 `文件地址`，例如：
 
@@ -58,12 +60,17 @@ data/processed/report/{RUN_ID}/db_import.csv     # 国际组织报告
 
 ## 附件规则
 
-`文件地址` 指向同一 run 目录下的 `fulltext/` 文件：
+学术/报告的 `文件地址` 指向 `fulltext/`；国际新闻指向实际存在的原始
+`articles/{id}.md`，没有 Markdown 时填 `None`。使用新闻导出脚本的
+`--no-attachments` 可将新闻附件统一置为 `None`，只导入元数据和原始 URL。
+
+示例：
 
 ```text
 fulltext/W2606951880.pdf
 fulltext/W2606951880.xml
 fulltext/10665_62630.pdf
+articles/9b45d7b87cd06696.md
 ```
 
 没有下载到附件时写 `None`。导入时不要因为 `文件地址=None` 就丢弃该行，这类记录仍然有元数据价值。
@@ -85,7 +92,7 @@ fulltext/10665_62630.pdf
 
 ## 导入建议
 
-- 学术文献和报告建议分开导入，避免分类和话语类型混淆。
+- 学术文献、报告和国际新闻建议分开导入，避免分类和话语类型混淆。
 - 去重优先使用 DOI；没有 DOI 时使用 `*文件名`。
 - 不建议按标题去重，因为同名报告、系列论文和版本更新可能合法存在。
 - 导入前先抽样 3-10 行测试附件关联、中文编码、日期格式和阶段枚举。

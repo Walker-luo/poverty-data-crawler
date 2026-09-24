@@ -764,7 +764,7 @@ data/processed/report/{run_id}/
 | ------------------ | ------------------------------------------ | ------------------------------------------------------------------------------------------------- | -------------------------- |
 | **① 学术文献**     | OpenAlex / Crossref 论文（引用/概念/机构） | [academic_collector.py](academic_collector.py) + [academic_export_csv.py](academic_export_csv.py) | `data/processed/academic/` |
 | **② 官方组织报告** | WHO/World Bank 等 DSpace 报告库（含全文）  | [report_collector.py](report_collector.py) + [report_export_csv.py](report_export_csv.py)         | `data/processed/report/`   |
-| **③ 国际新闻**     | 国际英文媒体（Bing 新闻搜索）              | [english_news_collector.py](english_news_collector.py)                                            | `data/processed/news/en/` |
+| **③ 国际新闻**     | 国际英文媒体（Bing 新闻搜索）              | [english_news_collector.py](english_news_collector.py) + [english_news_export_csv.py](english_news_export_csv.py) | `data/processed/news/en/` |
 
 三者统一 `source_type` 字段（`academic` / `report` / `news`），后续合并建图。
 
@@ -825,6 +825,30 @@ python english_news_collector.py --check-search --bing-host cn
 python english_news_collector.py --inspect-search --bing-host cn --timeout 45
 python english_news_collector.py --inspect-search --use-proxy --timeout 45
 ```
+
+### 导出数据库导入 CSV（不清洗正文）
+
+`english_news_export_csv.py` 逐行读取 `news.csv`，将标题、搜索摘要、日期、来源和原始 URL
+写入数据库模板；不读取 Markdown 正文，也不请求网站或调用 LLM。已下载的原始
+`articles/{id}.md` 会作为附件写入 `文件地址`，没有对应文件时填 `None`。若不想把未经清洗的
+Markdown 作为附件导入，使用 `--no-attachments`，仍保留所有新闻的元数据和原始 URL。
+
+```bash
+python english_news_export_csv.py --run-id 20260918_142736
+python english_news_export_csv.py --run-id 20260918_142736 --no-attachments
+python english_news_export_csv.py                 # 最新 run
+python english_news_export_csv.py --all           # 合并全部 run，按 URL 去重
+python english_news_export_csv.py --run-id 20260918_142736 --out news_import.csv --desc-chars 500
+```
+
+单 run 默认输出 `data/processed/news/en/{run_id}/db_import.csv`；`--all` 默认输出
+`data/processed/news/en/db_import.csv`。`文件地址` 相对于输出 CSV 所在目录。
+`*文件名` 使用新闻 `id`，`*分类=news`，`*类型=text`，官方媒体的
+`*话语类型=institutional`，其他为 `civilian`。`*国家` 优先使用元数据中的
+`scope` / `country_focus`，旧数据缺少这些字段时根据标题和摘要是否提及中国推断；
+中国新闻的发展阶段按发布日期推断，无法确认日期时留空。
+`描述 / 内容` 直接使用采集时的搜索摘要，可能带媒体名、相对时间或截断文字，需要高质量
+摘要时再清洗。数据库页面可用 `原始URL` 链接到来源网站。
 
 `--limit` 表示本次新增采集或本次下载最多处理多少条。采集器按 URL 去重；正文下载检查 `articles/{id}.md`，中断后重复执行会继续处理未完成条目。正文提取会依次尝试 JSON-LD 的 `articleBody`、SPA 内嵌的 `content/blocks/paragraphs`、canonical/AMP/`og:url` 关联页面、常见新闻正文容器和 div/表格文本，因此可兼容 MSN、政府旧 CMS 等没有标准 `<p>` 的页面；专题页、备案页、验证码和拦截页会被识别并记录具体跳过原因。失败会实时追加到 `fail.log`，终端显示进度，`summary.md` 保存最近一次汇总。指定旧 run ID 时，程序也会兼容读取此前的 `data/processed/env_news/{run_id}/` 目录。
 
