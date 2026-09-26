@@ -188,7 +188,9 @@ def filter_run(run_dir: Path, keep_ratio: float, output_dir: Optional[str],
     selected_dir = None
     if copy_selected:
         percent = int(round(keep_ratio * 100))
-        selected_dir = article_dir / f"quality_selected_{percent}"
+        # Keep selected files beside articles/ so they are clearly a separate
+        # attachment set and can be referenced directly by the export script.
+        selected_dir = run_dir / f"quality_selected_{percent}"
         selected_dir.mkdir(parents=True, exist_ok=True)
         for row in scored[:selected_count]:
             shutil.copy2(str(row["path"]), selected_dir / Path(str(row["path"])).name)
@@ -206,7 +208,7 @@ def main() -> None:
     parser.add_argument("--run-id", help="指定国际新闻 run，默认最新")
     parser.add_argument("--keep-ratio", type=float, default=0.7, help="保留有效 Markdown 的比例，默认 0.7")
     parser.add_argument("--scores-out", help="评分明细 CSV 路径，默认写入 articles/quality_scores.csv")
-    parser.add_argument("--copy-selected", action="store_true", help="将选中的正文复制到 articles/quality_selected_{百分比}/")
+    parser.add_argument("--copy-selected", action="store_true", help="将选中的正文复制到 run/quality_selected_{百分比}/")
     args = parser.parse_args()
     if not 0 < args.keep_ratio <= 1:
         parser.error("--keep-ratio 必须大于 0 且不超过 1")

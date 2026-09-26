@@ -807,19 +807,23 @@ python english_news_collector.py --inspect-search --use-proxy --timeout 45
 python english_news_quality_filter.py --run-id <RUN_ID> --keep-ratio 0.7 --copy-selected
 ```
 
-评分写入 `articles/quality_scores.csv`，入选文件复制到
-`articles/quality_selected_70/`，原始文件不修改。
+评分写入 `articles/quality_scores.csv`，入选文件复制到与 `articles/` 同级的
+`quality_selected_70/`，原始文件不修改。
 
 导出数据库 CSV 不调用网络或 LLM：
 
 ```bash
 python english_news_export_csv.py --run-id <RUN_ID>
 python english_news_export_csv.py --run-id <RUN_ID> --no-attachments
+# 只把与 articles/ 同级的 quality_selected_70/ 中的正文作为附件，其余文件地址填 None
+python english_news_export_csv.py --run-id <RUN_ID> --quality-dir quality_selected_70
 python english_news_export_csv.py --all
 ```
 
 CSV 使用统一数据库字段；`描述 / 内容` 默认取搜索摘要，`文件地址` 指向已下载正文，
-没有正文时为 `None`。需要高质量摘要时，再运行 `english_news_cleaner.py`。
+没有正文时为 `None`。`--quality-dir` 不会删除或减少元数据记录，只限制“文件地址”；
+例如 `quality_selected_70` 之外的正文会填 `None`。需要高质量摘要时，再运行
+`english_news_cleaner.py`。
 
 ### 主要参数
 
@@ -835,6 +839,7 @@ CSV 使用统一数据库字段；`描述 / 内容` 默认取搜索摘要，`文
 | `--retry-failed` | 重试 `google-ssl`、`ssl` 或 `all` 历史失败 |
 | `--use-proxy` / `--proxy` | 使用代理；默认端口为 `127.0.0.1:7897` |
 | `--check-search` / `--inspect-search` | 检查服务器搜索连通性和解析结果 |
+| `--quality-dir` | 只将指定筛选目录中的正文写入“文件地址”，目录外填 `None` |
 
 服务器采集数量异常时，先运行 `--inspect-search`，再查看 `summary.md`、`fail.log` 和
 `debug/`；使用代理时确认 `127.0.0.1:7897` 确实可访问外网。

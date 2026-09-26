@@ -168,7 +168,7 @@ python english_news_collector.py --download-only --run-id <RUN_ID> --use-proxy -
 - `download_log.json` 是正文下载状态的主要依据：成功项跳过，失败项可在续跑时重试；`fail.log` 用于人工诊断，不应作为唯一状态源。
 - `articles/download_summary.md` 汇总正文文件的成功、失败、待处理和状态异常数量，并在下载过程中实时更新。
 - `english_news_export_csv.py` 可直接把采集元数据导出为数据库 CSV，描述使用原始搜索摘要；清洗器也会生成同名 CSV，运行顺序决定最终内容。
-- `english_news_quality_filter.py` 可在不调用 LLM 的情况下按规则评分正文，输出 `articles/quality_scores.csv`，并可把最高分文件复制到 `articles/quality_selected_{比例}/`；原始正文不删除。
+- `english_news_quality_filter.py` 可在不调用 LLM 的情况下按规则评分正文，输出 `articles/quality_scores.csv`，并可把最高分文件复制到与 `articles/` 同级的 `quality_selected_{比例}/`；原始正文不删除。
 - 正文下载默认正常校验证书；仅遇到 `SSLError` 时，对当前 URL 使用 `verify=False` 再尝试一次。403、404、429、验证码和 JS 页面仍应按失败记录。
 - 当前正文下载逻辑会尝试页面正文和候选 canonical/AMP/`og:url` 页面，以减少“正文过短”。
 

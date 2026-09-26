@@ -107,14 +107,21 @@ def _stage(pub_date: str) -> str:
 
 
 def _build_row(row: Dict[str, str], run_dir: Path, output_dir: Path,
-               desc_chars: int, attachments: bool) -> Dict[str, str]:
+               desc_chars: int, attachments: bool,
+               attachment_dir: Optional[Path] = None,
+               attachment_ids: Optional[set[str]] = None) -> Dict[str, str]:
     identifier = (row.get("id") or "").strip()
     china = _is_china(row)
     focus = (row.get("country_focus") or "").strip()
     pub_date = _publish_date(row)
-    article_path = run_dir / "articles" / f"{identifier}.md"
+    article_path = (attachment_dir or (run_dir / "articles")) / f"{identifier}.md"
     file_address = "None"
-    if attachments and article_path.is_file() and article_path.stat().st_size > 0:
+    has_attachment = (
+        identifier in attachment_ids
+        if attachment_ids is not None
+        else article_path.is_file() and article_path.stat().st_size > 0
+    )
+    if attachments and has_attachment:
         file_address = Path(os.path.relpath(article_path.resolve(), output_dir.resolve())).as_posix()
     return {
         "*文件名": identifier,
@@ -136,7 +143,7 @@ def _build_row(row: Dict[str, str], run_dir: Path, output_dir: Path,
 
 def export(run_id: Optional[str] = None, all_runs: bool = False,
            out_path: Optional[str] = None, desc_chars: int = 1000,
-           attachments: bool = True) -> int:
+           attachments: bool = True, quality_dir: Optional[str] = None) -> int:
     if desc_chars < 1:
         raise ValueError("--desc-chars 必须大于 0")
     runs = _run_dirs(run_id, all_runs)
@@ -145,6 +152,33 @@ def export(run_id: Optional[str] = None, all_runs: bool = False,
     output.parent.mkdir(parents=True, exist_ok=True)
     seen = set()
     total = with_file = with_summary = 0
+    quality_dirs: Dict[Path, Optional[Path]] = {}
+    quality_ids: Dict[Path, Optional[set[str]]] = {}
+    if quality_dir and not attachments:
+        logger.warning("--quality-dir 与 --no-attachments 同时使用，按 --no-attachments 处理")
+    for run_dir in runs:
+        if not quality_dir:
+            quality_dirs[run_dir] = None
+            quality_ids[run_dir] = None
+            continue
+        configured = Path(quality_dir).expanduser()
+        candidates = [configured] if configured.is_absolute() else [
+            run_dir / configured,
+            run_dir / "articles" / configured,
+        ]
+        selected_dir = next((path for path in candidates if path.is_dir()), None)
+        if selected_dir is None:
+            raise SystemExit(
+                f"未找到质量筛选目录: {quality_dir}（run {run_dir.name}，"
+                f"期望位置为 {run_dir / 'articles' / quality_dir}）"
+            )
+        quality_dirs[run_dir] = selected_dir
+        selected_ids = {
+            item.stem for item in selected_dir.iterdir()
+            if item.is_file() and item.suffix.lower() == ".md" and item.stat().st_size > 0
+        }
+        quality_ids[run_dir] = selected_ids
+        logger.info("run %s 仅使用筛选正文: %s（%s 篇）", run_dir.name, selected_dir, len(selected_ids))
     with output.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
         writer.writeheader()
@@ -156,7 +190,11 @@ def export(run_id: Optional[str] = None, all_runs: bool = False,
                 if not identifier or not url or key in seen:
                     continue
                 seen.add(key)
-                row = _build_row(news, run_dir, output.parent, desc_chars, attachments)
+                row = _build_row(
+                    news, run_dir, output.parent, desc_chars, attachments,
+                    quality_dirs[run_dir] if quality_dir else None,
+                    quality_ids[run_dir] if quality_dir else None,
+                )
                 writer.writerow(row)
                 total += 1
                 with_file += row["文件地址"] != "None"
@@ -176,11 +214,18 @@ def main() -> None:
     parser.add_argument("--out", help="指定输出 CSV 路径")
     parser.add_argument("--desc-chars", type=int, default=1000, help="摘要字符上限（默认 1000）")
     parser.add_argument("--no-attachments", action="store_true", help="文件地址统一填 None，仅导出元数据与原始 URL")
+    parser.add_argument(
+        "--quality-dir",
+        help="仅将指定筛选目录中的 Markdown 写入文件地址，例如 quality_selected_70；目录外文件填 None",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     if args.desc_chars < 1:
         parser.error("--desc-chars 必须大于 0")
-    export(args.run_id, args.all, args.out, args.desc_chars, not args.no_attachments)
+    export(
+        args.run_id, args.all, args.out, args.desc_chars,
+        not args.no_attachments, args.quality_dir,
+    )
 
 
 if __name__ == "__main__":
