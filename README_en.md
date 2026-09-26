@@ -770,193 +770,78 @@ data/processed/report/{run_id}/
 
 ## 三、国际英文新闻采集
 
-`english_news_collector.py` 独立于中文新闻流水线，采集关于中国贫困治理、减贫、脱贫、乡村振兴和共同富裕的英文新闻。默认结果保存到 `data/processed/news/en/{run_id}/`，包括 `news.json`、`news.csv`、`summary.md`、`fail.log`、正文目录 `articles/{id}.md` 和下载汇总 `articles/download_summary.md`。其中 `en` 与 `data/processed/news/{run_id}/` 的中文新闻目录分开。
+`english_news_collector.py` 采集中国及全球减贫主题的多语种新闻，结果保存到
+`data/processed/news/en/{run_id}/`。不指定筛选参数时默认全量采集（2000 年至今）。
 
-默认关键词覆盖 `China poverty`、`China poverty alleviation`、`China poverty reduction`、`targeted poverty alleviation China`、`China rural revitalization`、`China common prosperity` 等。内置媒体包括 CGTN、Xinhua English、People's Daily Online、China Daily、english.gov.cn，以及 Reuters、BBC、The Guardian、SCMP、The Diplomat、Sixth Tone、Caixin Global。
-
-当前无参数运行 `python english_news_collector.py` 即执行默认全量采集：范围为中国 + 全球，使用内置多语种关键词，年份覆盖 2000 年至当前年份，默认每个关键词/年份最多 10 页，不设置 `--limit`。`--countries` 是额外的国家限定扩展，默认不展开，因为它会使查询组合数量成倍增加。
-
-### 基本命令
+### 常用命令
 
 ```bash
-# 默认全量采集：中国 + 全球多语种关键词
+# 全量采集
 python english_news_collector.py
 
-# 默认全量采集并下载正文（服务器代理）
-python english_news_collector.py --use-proxy --delay 2 --timeout 45 --download
+# 采集并下载正文；服务器使用本机 7897 代理
+python english_news_collector.py --download --use-proxy --proxy-port 7897 --timeout 45
 
-# 中国英文小批量测试
+# 小批量测试
 python english_news_collector.py --scope china --languages en --years 2024 2025 2026 --pages 1 --limit 30
 
-# 全球多语种小批量测试
-python english_news_collector.py --scope global --languages en es fr --years 2024 2025 2026 --pages 1 --limit 30
+# 继续已有 run 的下载，已有 Markdown 自动跳过
+python english_news_collector.py --run-id <RUN_ID> --download-only
 
-# 全球多语种 + 指定国家
-python english_news_collector.py --scope global --languages en es fr pt --countries India Brazil South_Africa --years 2020 2021 2022 2023 2024 2025 2026 --pages 3
+# 只重试 Google News 的 SSL 失败
+python english_news_collector.py --run-id <RUN_ID> --download-only --retry-failed google-ssl --use-proxy --proxy-port 7897
 
-# 中国与全球语料合并采集
-python english_news_collector.py --scope all --languages en zh es fr pt --countries India Brazil South_Africa --years 2020 2021 2022 2023 2024 2025 2026 --pages 3
-
-# 指定关键词、年份和翻页深度
-python english_news_collector.py --keywords "China rural revitalization" "China poverty" --years 2020 2021 2022 2023 2024 2025 2026 --pages 10
-
-# 只保留指定媒体
-python english_news_collector.py --sources Reuters BBC CGTN --limit 20
-
-# 采集后立即下载正文
-python english_news_collector.py --limit 10 --download
-
-# 对已有 run 继续采集和下载，已有 URL/Markdown 自动跳过
-python english_news_collector.py --run-id 20260916_120000 --limit 100 --download
-
-# 只对已有 run 下载正文，不重新访问 Bing
-python english_news_collector.py --run-id 20260916_120000 --download-only --limit 20
-
-# 代理恢复后，只重试 Google News 链接的历史 SSL 失败
-python english_news_collector.py --run-id 20260916_120000 --download-only --retry-failed google-ssl --use-proxy --proxy-port 7897
-
-# 对已下载正文进行英文 LLM 清洗，并生成数据库导入 CSV
-python english_news_cleaner.py --run-id 20260916_120000 --batch-size 5 --limit 20
-
-# 服务器排查：只测试 Bing 新闻搜索，不正式采集
-python english_news_collector.py --check-search
-python english_news_collector.py --inspect-search
-python english_news_collector.py --check-search --bing-host cn
-python english_news_collector.py --inspect-search --bing-host cn --timeout 45
+# 检查服务器搜索连通性
 python english_news_collector.py --inspect-search --use-proxy --timeout 45
 ```
 
-### 导出数据库导入 CSV（不清洗正文）
+下载状态写入 `download_log.json`、`fail.log` 和
+`articles/download_summary.md`；重复运行会跳过已有正文。Google News 的 SSL 失败可用
+`--retry-failed google-ssl` 重试。
 
-`english_news_export_csv.py` 逐行读取 `news.csv`，将标题、搜索摘要、日期、来源和原始 URL
-写入数据库模板；不读取 Markdown 正文，也不请求网站或调用 LLM。已下载的原始
-`articles/{id}.md` 会作为附件写入 `文件地址`，没有对应文件时填 `None`。若不想把未经清洗的
-Markdown 作为附件导入，使用 `--no-attachments`，仍保留所有新闻的元数据和原始 URL。
+### 筛选与导出
 
-```bash
-python english_news_export_csv.py --run-id 20260918_142736
-python english_news_export_csv.py --run-id 20260918_142736 --no-attachments
-python english_news_export_csv.py                 # 最新 run
-python english_news_export_csv.py --all           # 合并全部 run，按 URL 去重
-python english_news_export_csv.py --run-id 20260918_142736 --out news_import.csv --desc-chars 500
-```
-
-单 run 默认输出 `data/processed/news/en/{run_id}/db_import.csv`；`--all` 默认输出
-`data/processed/news/en/db_import.csv`。`文件地址` 相对于输出 CSV 所在目录。
-`*文件名` 使用新闻 `id`，`*分类=news`，`*类型=text`，官方媒体的
-`*话语类型=institutional`，其他为 `civilian`。`*国家` 优先使用元数据中的
-`scope` / `country_focus`，旧数据缺少这些字段时根据标题和摘要是否提及中国推断；
-中国新闻的发展阶段按发布日期推断，无法确认日期时留空。
-`描述 / 内容` 直接使用采集时的搜索摘要，可能带媒体名、相对时间或截断文字，需要高质量
-摘要时再清洗。数据库页面可用 `原始URL` 链接到来源网站。
-
-`--limit` 表示本次新增采集或本次下载最多处理多少条。采集器按 URL 去重；正文下载检查 `articles/{id}.md`，中断后重复执行会继续处理未完成条目。正文提取会依次尝试 JSON-LD 的 `articleBody`、SPA 内嵌的 `content/blocks/paragraphs`、canonical/AMP/`og:url` 关联页面、常见新闻正文容器和 div/表格文本，因此可兼容 MSN、政府旧 CMS 等没有标准 `<p>` 的页面；专题页、备案页、验证码和拦截页会被识别并记录具体跳过原因。失败会实时追加到 `fail.log`，终端显示进度，`summary.md` 保存最近一次汇总。指定旧 run ID 时，程序也会兼容读取此前的 `data/processed/env_news/{run_id}/` 目录。
-
-默认 `--scope all` 执行全量采集，覆盖中国与全球扶贫治理。需要只采中国时使用 `--scope china`；只采全球时使用 `--scope global`。`--languages` 支持英语 `en`、西班牙语 `es`、法语 `fr`、葡萄牙语 `pt`、阿拉伯语 `ar`、印地语 `hi`、印尼语 `id`、越南语 `vi` 和中文 `zh`。`--countries` 会把国家名追加到全球关键词后，例如 `poverty reduction India`；默认不展开国家组合，避免无参数全量任务产生过多查询。
-
-新采集的 `news.csv/news.json` 会额外记录：`language`（查询语言）、`country_focus`（国家限定词，全球通用查询为空）和 `scope`（`china` / `global`）。清洗器会把这些信息传给大模型，生成 `db_import.csv` 时中国资源标记为 `china`，指定国家写入“地区”，其他全球资源标记为 `global`。
-
-采集每完成一页就写回 `news.json/news.csv`。下载每完成一篇就更新 `download_log.json`，记录 `success` 或 `failed` 及原因，同时实时更新 `articles/download_summary.md`。该文件汇总元数据总数、已经下载、失败、未下载/待处理和状态记录异常数量，并单独记录本次运行的选中数、成功数、失败数、跳过数和 `--limit` 延后数。因此程序中断后也能直接查看当前进度，再使用 `--download-only` 继续已有 run，不会重新检索新闻。
-
-若代理中断导致一批 Google News 跳转链接出现 `SSLError`，恢复代理后使用 `--retry-failed google-ssl`，只会选择 `download_log.json` 中 `status=failed` 且错误属于 `news.google.com` SSL 的记录，不处理其他失败项或从未下载的文章。`--retry-failed ssl` 会重试所有站点的 SSL 失败，`--retry-failed all` 会重试全部历史失败；三种模式均跳过已有正文和成功记录，也可配合 `--limit 10` 小批量测试。筛选依据是 `download_log.json`，不依赖 `fail.log`。
-
-如果本机能采集、服务器只有少量结果，优先执行 `--check-search`。脚本会请求固定测试词 `China poverty 2024`，并把异常页面保存到 `data/processed/news/en/{run_id}/debug/`，同时在 `fail.log` 写明是请求失败、验证码/反爬、被重定向到首页、正常无结果，还是 Bing HTML 结构变化。`--download` 会先搜索再下载；如果服务器搜索阶段就是 0 条，后续自然不会下载正文。
-
-需要更详细排查时用 `--inspect-search`，它会分别打印 `www.bing.com` / `cn.bing.com` 的 HTTP 状态码、最终 URL、页面标题、响应长度和解析到的新闻数量。可以配合 `--debug-query` 改测试词。
-
-正文下载的 HTTPS 证书处理：默认先按系统/certifi 进行正常证书校验；如果某个新闻站点在 Windows 服务器或代理环境下触发 SSLCertVerificationError，脚本只对当前正文 URL 自动使用 verify=False 重试一次，并局部抑制对应的警告，不会全局关闭搜索请求的证书校验。重试仍失败、或返回 403/404/429、验证码、JS 拦截页时，仍会按失败处理，并实时写入 fail.log 与 download_log.json。该机制不能绕过站点封禁或代理不可达问题。
-
-Windows 服务器建议先更新证书和网络依赖：`python -m pip install -U certifi requests urllib3`，检查系统时间、代理地址及代理是否允许 HTTPS CONNECT；也可用 `--use-proxy --proxy 127.0.0.1:7897`（或设置 NEWS_PROXY）运行。若服务器没有可用代理，不要开启 `--use-proxy`。
-
-采集器在 `auto` 模式下会合并 `www.bing.com` 和 `cn.bing.com` 的结果；当 HTML 结果不足 `--rss-threshold` 条时，会自动请求 Bing RSS，再不足时请求 Google News RSS 作为第二层兜底。`summary.md` 会记录 HTML/Bing RSS/Google RSS 请求数和解析结果数，便于判断服务器是否只返回了精简页面。默认 `--pages` 已改为 10；如果服务器出口容易被限流，可手动降低到 1-3 并增大 `--delay`。
-
-分页不会因为“当前页全是前面关键词已经采过的 URL”而提前停止。只有返回空页，或同一个查询连续返回完全相同的分页结果时才停止；这样可以继续访问后续页，减少关键词重叠导致的漏采。
-
-| 参数              | 作用                                               |
-| ----------------- | -------------------------------------------------- |
-| `--run-id`        | 指定已有目录，执行增量采集或断点下载               |
-| `--keywords`      | 自定义关键词，可传多个；指定后优先使用自定义词       |
-| `--scope`         | `all`（默认全量）、`china`（中国）、`global`（全球） |
-| `--languages`     | 查询语言；all 默认 `en/zh/es/fr/pt/ar/hi/id/vi`     |
-| `--countries`     | 全球模式追加国家限定词，如 `India Brazil South_Africa` |
-| `--sources`       | 按媒体名称过滤，名称见脚本内 `MEDIA`               |
-| `--years`         | 指定检索年份，默认 2000 年至当前年份               |
-| `--pages`         | 每个关键词/年份最多翻页数，默认 10                 |
-| `--limit`         | 限制本次新增采集或正文下载数量                     |
-| `--download`      | 下载新闻正文为 Markdown                            |
-| `--download-only` | 只读取指定 run 的 `news.json` 下载正文，不重新采集 |
-| `--retry-failed`  | 配合 `--download-only`，仅重试 `google-ssl` / `ssl` / `all` 历史失败 |
-| `--delay`         | 请求间隔，默认 1.5 秒                              |
-| `--timeout`       | 请求超时时间，默认 20 秒；服务器代理慢可调到 45-60 秒 |
-| `--use-proxy`     | 启用内置 `127.0.0.1:7897` HTTP 代理             |
-| `--proxy`         | 指定完整代理地址，覆盖内置代理设置               |
-| `--proxy-host`    | `--use-proxy` 的代理主机，默认 `127.0.0.1`       |
-| `--proxy-port`    | `--use-proxy` 的代理端口，默认 `7897`            |
-| `--rss-threshold` | HTML 单次结果少于该数量时启用 RSS 兜底，默认 5    |
-| `--no-rss-fallback` | 关闭 RSS 兜底，仅使用 Bing HTML 页面             |
-| `--no-google-fallback` | 关闭 Google News RSS 第二层兜底                 |
-| `--bing-host`     | Bing 域名策略：`auto` 先试 `www` 再试 `cn`；服务器异常时可指定 `cn` |
-| `--check-search`  | 只做 Bing 新闻搜索预检，保存诊断，不采集数据       |
-| `--inspect-search`| 输出状态码/最终 URL/标题/解析数量，排查服务器 0 条 |
-| `--debug-query`   | 指定预检查询词，默认 `China poverty 2024`          |
-
-### 服务器 0 条排查
+不使用 LLM 时，可按正文长度、结构和噪声评分筛选正文：
 
 ```bash
-# 1. 先看服务器是否能访问并解析 Bing 新闻结果
-python english_news_collector.py --check-search
-
-# 1.1 更详细诊断：分别查看 www/cn 的状态码、最终 URL、标题、解析数量
-python english_news_collector.py --inspect-search
-python english_news_collector.py --inspect-search --debug-query "China rural revitalization 2024"
-python english_news_collector.py --inspect-search --timeout 45
-
-# 2. 如果 www.bing.com 异常，指定 cn.bing.com 再测
-python english_news_collector.py --check-search --bing-host cn
-python english_news_collector.py --inspect-search --bing-host cn --timeout 45
-
-# 3. cn 可用后正式采集
-python english_news_collector.py --pages 10 --delay 2 --download --bing-host cn --timeout 45 --use-proxy
+python english_news_quality_filter.py --run-id <RUN_ID> --keep-ratio 0.7 --copy-selected
 ```
 
-如果 `--inspect-search` 显示 HTML 只能解析到 1-3 条，正式采集时默认会自动尝试 Bing RSS，再尝试 Google News RSS；可在 `summary.md` 查看三类 fallback 的请求数和解析数。若只想验证 Bing HTML，使用 `--no-rss-fallback --no-google-fallback`。
+评分写入 `articles/quality_scores.csv`，入选文件复制到
+`articles/quality_selected_70/`，原始文件不修改。
 
-### 服务器代理
-
-服务器如果通过本机代理访问外网，脚本内置代理端口为 `127.0.0.1:7897`，但默认不强制启用。服务器上建议先用：
+导出数据库 CSV 不调用网络或 LLM：
 
 ```bash
-# 使用代码内置的 127.0.0.1:7897
-python english_news_collector.py --inspect-search --use-proxy --timeout 45
-
-# 确认代理可用后全量采集并下载
-python english_news_collector.py --pages 10 --delay 2 --timeout 45 --use-proxy --download
-
-# 如果代理不是本机，或端口不同，显式指定完整地址
-python english_news_collector.py --proxy http://127.0.0.1:7897 --pages 10 --delay 2 --download
-python english_news_collector.py --proxy http://PROXY_HOST:7897 --pages 10 --delay 2 --download
+python english_news_export_csv.py --run-id <RUN_ID>
+python english_news_export_csv.py --run-id <RUN_ID> --no-attachments
+python english_news_export_csv.py --all
 ```
 
-代码会对搜索、Bing RSS、Google News RSS 和正文下载统一使用该代理。也可以设置环境变量后不写参数：
+CSV 使用统一数据库字段；`描述 / 内容` 默认取搜索摘要，`文件地址` 指向已下载正文，
+没有正文时为 `None`。需要高质量摘要时，再运行 `english_news_cleaner.py`。
 
-```bash
-export NEWS_PROXY=http://127.0.0.1:7897
-python english_news_collector.py --pages 10 --delay 2 --download
-```
+### 主要参数
 
-如果 `7897` 实际是 SOCKS5 端口，使用 `socks5h://127.0.0.1:7897`，并安装 `requests[socks]`；普通 HTTP 代理使用 `http://127.0.0.1:7897`。
+| 参数 | 用途 |
+|---|---|
+| `--run-id` | 复用已有数据目录 |
+| `--scope` | `all`（默认）、`china`、`global` |
+| `--languages` | 查询语言，如 `en es fr` |
+| `--countries` | 全球查询追加国家名 |
+| `--years` / `--pages` | 限定年份和每个查询的翻页数 |
+| `--limit` | 测试时限制采集或下载数量 |
+| `--download` / `--download-only` | 采集后下载，或只下载已有 run |
+| `--retry-failed` | 重试 `google-ssl`、`ssl` 或 `all` 历史失败 |
+| `--use-proxy` / `--proxy` | 使用代理；默认端口为 `127.0.0.1:7897` |
+| `--check-search` / `--inspect-search` | 检查服务器搜索连通性和解析结果 |
 
-查看输出目录中的 `fail.log` 和 `debug/*.html`：
-
-- `疑似验证码/反爬/访问被拦截`：服务器出口 IP 或代理被 Bing 拦截，换代理/出口 IP，或加大 `--delay`
-- `被重定向到非 news/search 页面`：服务器访问 Bing 被地区页/首页接管，尝试 `--bing-host cn`
-- `响应过短`：代理或网关返回错误页，检查 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量
-- `未发现新闻卡片或外部新闻链接`：Bing 返回的 HTML 结构和本机不同，把 `debug/*.html` 用浏览器打开即可定位
-
-`summary.md` 中的 `Duplicate/filtered results` 表示解析到了但已经被 URL 去重或来源过滤的结果；`Pages without new records` 表示某些分页没有新增 URL，但程序仍会继续翻页，不代表采集已经结束。
+服务器采集数量异常时，先运行 `--inspect-search`，再查看 `summary.md`、`fail.log` 和
+`debug/`；使用代理时确认 `127.0.0.1:7897` 确实可访问外网。
 
 ### 多语种新闻清洗
 
-`english_news_cleaner.py` 只处理 `articles/` 下已经下载的 Markdown，已存在且有效的 `articles/clean/{id}.md` 会跳过。它会根据 `language` 保持原文语言清洗，默认每 5 篇调用一次 DeepSeek，失败批次写入同一 run 的 `fail.log`，清洗完成后生成 `db_import.csv`。需要设置 `DEEPSEEK_API_KEY`，或通过 `--api-key` 传入。
+`english_news_cleaner.py` 处理已下载的 Markdown，跳过已有清洗结果，默认每 5 篇调用一次
+DeepSeek，并生成 `db_import.csv`。需要设置 `DEEPSEEK_API_KEY` 或使用 `--api-key`。
 
 ---
